@@ -44,7 +44,7 @@ describe('OpenAI proxy', () => {
     const models = await fetch(`${gateway.baseUrl}/v1/models`, {
       headers: { authorization: `Bearer ${gateway.gatewayToken}` },
     });
-    expect((await models.json()).data.map((model: { id: string }) => model.id)).toEqual(['virtual']);
+    expect((await models.json()).data.map((model: { id: string }) => model.id)).toEqual(['OpenAI/virtual']);
 
     const response = await fetch(`${gateway.baseUrl}/v1/chat/completions`, {
       method: 'POST',
@@ -391,7 +391,7 @@ describe('OpenAI proxy', () => {
     expect(secondUpstream.calls).toHaveLength(0);
   });
 
-  it('lists the union of channel models including disabled channels', async () => {
+  it('groups channel models by channel name including disabled channels', async () => {
     gateway = await startGateway();
     seedChannel(gateway.repository, {
       name: 'Enabled',
@@ -411,7 +411,14 @@ describe('OpenAI proxy', () => {
     });
     expect(response.status).toBe(200);
     const body = await response.json();
-    expect(body.data.map((model: { id: string }) => model.id)).toEqual(['a-model', 'b-model', 'shared']);
+    expect(
+      body.data.map((model: { id: string; owned_by: string }) => [model.id, model.owned_by]),
+    ).toEqual([
+      ['Enabled/b-model', 'Enabled'],
+      ['Enabled/shared', 'Enabled'],
+      ['Disabled/a-model', 'Disabled'],
+      ['Disabled/shared', 'Disabled'],
+    ]);
   });
 
   it('distinguishes unknown models from models with no enabled channel', async () => {
@@ -500,8 +507,135 @@ describe('OpenAI proxy', () => {
     });
     expect(response.status).toBe(200);
     const body = await response.json();
-    expect(body.data.map((model: { id: string }) => model.id)).toEqual(['a-model', 'shared']);
+    expect(body.data.map((model: { id: string }) => model.id)).toEqual(['First/a-model', 'First/shared']);
     expect(body.data[0].owned_by).toBe('First');
+  });
+
+  it('routes prefixed model ids to the matching channel and strips the prefix upstream', async () => {
+    upstream = await startFakeUpstream((call, _request, response) => {
+      response.setHeader('content-type', 'application/json');
+      response.end(
+        JSON.stringify({
+          id: 'chatcmpl-prefixed',
+          object: 'chat.completion',
+          model: JSON.parse(call.body).model,
+          choices: [{ index: 0, message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }],
+          usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+        }),
+      );
+    });
+    gateway = await startGateway();
+    seedChannel(gateway.repository, {
+      name: 'Primary',
+      protocol: 'openai',
+      baseUrl: upstream.baseUrl,
+      models: ['shared'],
+    });
+    seedChannel(gateway.repository, {
+      name: 'Secondary',
+      protocol: 'openai',
+      baseUrl: 'https://secondary.test/v1',
+      models: ['shared'],
+    });
+
+    const response = await fetch(`${gateway.baseUrl}/v1/chat/completions`, {
+      method: 'POST',
+      headers: chatHeaders(gateway.gatewayToken),
+      body: JSON.stringify({ model: 'Primary/shared', messages: [{ role: 'user', content: 'hello' }] }),
+    });
+    expect(response.status).toBe(200);
+    const body = await response.json();
+    expect(body.model).toBe('Primary/shared');
+    expect(JSON.parse(upstream.calls[0]!.body).model).toBe('shared');
+  });
+
+  it('echoes the prefixed model id in stream chunks', async () => {
+    upstream = await startFakeUpstream((_call, _request, response) => {
+      response.writeHead(200, { 'content-type': 'text/event-stream' });
+      response.write(
+        `data: ${JSON.stringify({ id: 'c1', object: 'chat.completion.chunk', model: 'shared', choices: [] })}\n\n`,
+      );
+      response.end('data: [DONE]\n\n');
+    });
+    gateway = await startGateway();
+    seedChannel(gateway.repository, {
+      name: 'Primary',
+      protocol: 'openai',
+      baseUrl: upstream.baseUrl,
+      models: ['shared'],
+    });
+    const response = await fetch(`${gateway.baseUrl}/v1/chat/completions`, {
+      method: 'POST',
+      headers: chatHeaders(gateway.gatewayToken),
+      body: JSON.stringify({ model: 'Primary/shared', messages: [{ role: 'user', content: 'hello' }], stream: true }),
+    });
+    const text = await response.text();
+    expect(text).toContain('"model":"Primary/shared"');
+    expect(JSON.parse(upstream.calls[0]!.body).model).toBe('shared');
+  });
+
+  it('rejects prefixed requests for missing models and disabled channels', async () => {
+    gateway = await startGateway();
+    seedChannel(gateway.repository, {
+      name: 'Active',
+      protocol: 'openai',
+      baseUrl: 'https://active.test/v1',
+      models: ['configured'],
+    });
+    seedChannel(gateway.repository, {
+      name: 'Stopped',
+      protocol: 'openai',
+      baseUrl: 'https://stopped.test/v1',
+      enabled: false,
+      models: ['configured'],
+    });
+
+    const missingModel = await fetch(`${gateway.baseUrl}/v1/chat/completions`, {
+      method: 'POST',
+      headers: chatHeaders(gateway.gatewayToken),
+      body: JSON.stringify({ model: 'Active/other', messages: [{ role: 'user', content: 'hello' }] }),
+    });
+    expect(missingModel.status).toBe(404);
+    expect((await missingModel.json()).error.code).toBe('model_not_found');
+
+    const disabled = await fetch(`${gateway.baseUrl}/v1/chat/completions`, {
+      method: 'POST',
+      headers: chatHeaders(gateway.gatewayToken),
+      body: JSON.stringify({ model: 'Stopped/configured', messages: [{ role: 'user', content: 'hello' }] }),
+    });
+    expect(disabled.status).toBe(503);
+    expect((await disabled.json()).error.code).toBe('channel_unavailable');
+  });
+
+  it('accepts prefixed model ids on channel endpoints', async () => {
+    upstream = await startFakeUpstream((call, _request, response) => {
+      response.setHeader('content-type', 'application/json');
+      response.end(
+        JSON.stringify({
+          id: 'chatcmpl-channel-prefixed',
+          object: 'chat.completion',
+          model: JSON.parse(call.body).model,
+          choices: [{ index: 0, message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }],
+          usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+        }),
+      );
+    });
+    gateway = await startGateway();
+    const channel = seedChannel(gateway.repository, {
+      name: 'Only',
+      protocol: 'openai',
+      baseUrl: upstream.baseUrl,
+      models: ['configured'],
+    });
+    const response = await fetch(`${gateway.baseUrl}/v1/channels/${channel.id}/chat/completions`, {
+      method: 'POST',
+      headers: chatHeaders(gateway.gatewayToken),
+      body: JSON.stringify({ model: 'Only/configured', messages: [{ role: 'user', content: 'hello' }] }),
+    });
+    expect(response.status).toBe(200);
+    const body = await response.json();
+    expect(body.model).toBe('Only/configured');
+    expect(JSON.parse(upstream.calls[0]!.body).model).toBe('configured');
   });
 
   it('returns channel-specific errors for missing channel, missing model, and disabled channel', async () => {

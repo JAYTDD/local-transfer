@@ -1,10 +1,11 @@
 import type { FastifyInstance } from 'fastify';
 
-import type { SettingsDto } from '@aihub/shared';
+import type { RelayChannelToggle, RelayStatusDto, SettingsDto } from '@aihub/shared';
 
 import { Repository } from './db.js';
 import { channelToDto, logsToDto } from './dto.js';
 import { AdminRequestError, sendAdminError } from './errors.js';
+import type { RelayModule } from './relay.js';
 import { pullUpstreamModels, testUpstreamChannel } from './upstream.js';
 import {
   channelInputSchema,
@@ -14,8 +15,21 @@ import {
   formatZodError,
   logQuerySchema,
   pullModelsSchema,
+  relaySettingsInputSchema,
   settingsInputSchema,
 } from './validation.js';
+
+/** relay 模块未接入（或测试里没传）时，按数据库设置给出同一份形状 */
+function relayStatus(repository: Repository, relay: RelayModule | null): RelayStatusDto {
+  if (relay) return relay.status();
+  const settings = repository.getSettings();
+  return {
+    enabled: settings.relayEnabled,
+    channels: settings.relayChannels,
+    ready: false,
+    prefixes: [],
+  };
+}
 
 function parseOrThrow<T>(schema: { safeParse(input: unknown): { success: true; data: T } | { success: false; error: Parameters<typeof formatZodError>[0] } }, input: unknown): T {
   const result = schema.safeParse(input);
@@ -23,7 +37,11 @@ function parseOrThrow<T>(schema: { safeParse(input: unknown): { success: true; d
   return result.data;
 }
 
-export async function registerAdminRoutes(app: FastifyInstance, repository: Repository): Promise<void> {
+export async function registerAdminRoutes(
+  app: FastifyInstance,
+  repository: Repository,
+  relay: RelayModule | null = null,
+): Promise<void> {
   app.get('/api/admin/session', async () => ({ ok: true, authRequired: false }));
 
   app.get('/api/admin/channels', async () => ({
@@ -186,6 +204,33 @@ export async function registerAdminRoutes(app: FastifyInstance, repository: Repo
           streamIdleTimeoutMs: settings.streamIdleTimeoutMs,
         },
       };
+    } catch (error) {
+      sendAdminError(reply, error);
+    }
+  });
+
+  app.get('/api/admin/relay', async () => ({ data: relayStatus(repository, relay) }));
+
+  app.put('/api/admin/relay', async (request, reply) => {
+    try {
+      const input = parseOrThrow(relaySettingsInputSchema, request.body);
+      const patch: { relayEnabled?: boolean; relayChannels?: RelayChannelToggle } = {};
+      if (input.enabled !== undefined) patch.relayEnabled = input.enabled;
+      if (input.channels !== undefined) {
+        // 通道开关是部分更新：先取现值再逐项合并，漏传的通道保持原样
+        const current = repository.getSettings().relayChannels;
+        patch.relayChannels = {
+          trae: input.channels.trae ?? current.trae,
+          workbuddy: input.channels.workbuddy ?? current.workbuddy,
+          qoder: input.channels.qoder ?? current.qoder,
+        };
+      }
+      repository.updateSettings(patch);
+      const settings = repository.getSettings();
+      // 装配 / 释放是异步的（读凭据、起 shim、拉目录），等它完成再回，
+      // 前端据此把 loading 一直显示到通道真的就绪。
+      await relay?.reconfigure({ enabled: settings.relayEnabled, channels: settings.relayChannels });
+      return { data: relayStatus(repository, relay) };
     } catch (error) {
       sendAdminError(reply, error);
     }

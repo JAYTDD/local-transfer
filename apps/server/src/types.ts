@@ -19,7 +19,7 @@ export interface LogRecordInput {
   virtualModel: string;
   channelId: string | null;
   channelName: string | null;
-  protocol: UpstreamProtocol | null;
+  protocol: UpstreamProtocol | 'relay' | null;
   upstreamModel: string | null;
   stream: boolean;
   status: 'ok' | 'error' | 'aborted' | 'upstream_error';

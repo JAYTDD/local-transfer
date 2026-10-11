@@ -13,7 +13,7 @@ import {
   Tooltip,
   Typography,
 } from 'antd';
-import type { ChannelDto, RequestLogDto } from '@aihub/shared';
+import type { ChannelDto, RelayStatusDto, RequestLogDto } from '@aihub/shared';
 
 import { getData } from '../api.js';
 
@@ -28,6 +28,7 @@ export function LogsPage({ token }: { token: string }) {
   const { message } = AntApp.useApp();
   const [logs, setLogs] = useState<RequestLogDto[]>([]);
   const [channels, setChannels] = useState<ChannelDto[]>([]);
+  const [relayPrefixes, setRelayPrefixes] = useState<RelayStatusDto['prefixes']>([]);
   const [loading, setLoading] = useState(true);
   const [detail, setDetail] = useState<RequestLogDto | null>(null);
   const [filters, setFilters] = useState<{
@@ -44,12 +45,14 @@ export function LogsPage({ token }: { token: string }) {
       for (const [key, value] of Object.entries(filters)) {
         if (value) params.set(key, value);
       }
-      const [nextLogs, nextChannels] = await Promise.all([
+      const [nextLogs, nextChannels, relayStatus] = await Promise.all([
         getData<RequestLogDto[]>(`/api/admin/logs?${params}`, token),
         getData<ChannelDto[]>('/api/admin/channels', token),
+        getData<RelayStatusDto>('/api/admin/relay', token),
       ]);
       setLogs(nextLogs);
       setChannels(nextChannels);
+      setRelayPrefixes(relayStatus.prefixes);
     } catch (error) {
       message.error(error instanceof Error ? error.message : '加载日志失败');
     } finally {
@@ -73,44 +76,72 @@ export function LogsPage({ token }: { token: string }) {
         </Button>
       </div>
 
-      <div className="filter-bar">
-        <Select
-          allowClear
-          placeholder="渠道"
-          style={{ width: 180 }}
-          value={filters.channelId}
-          onChange={(value) => setFilters((current) => ({ ...current, channelId: value }))}
-          options={channels.map((channel) => ({ value: channel.id, label: channel.name }))}
-        />
-        <Select
-          allowClear
-          placeholder="状态"
-          style={{ width: 150 }}
-          value={filters.status}
-          onChange={(value) => setFilters((current) => ({ ...current, status: value }))}
-          options={Object.keys(STATUS_COLORS).map((status) => ({ value: status, label: status }))}
-        />
-        <Select
-          allowClear
-          placeholder="请求类型"
-          style={{ width: 140 }}
-          value={filters.stream}
-          onChange={(value) => setFilters((current) => ({ ...current, stream: value }))}
-          options={[
-            { value: 'true', label: '流式' },
-            { value: 'false', label: '非流式' },
-          ]}
-        />
-        <DatePicker.RangePicker
-          showTime
-          onChange={(range) => {
-            const next = filters as typeof filters & { from?: string; to?: string };
-            next.from = range?.[0] ? String(Math.floor(range[0].valueOf() / 1000)) : undefined;
-            next.to = range?.[1] ? String(Math.floor(range[1].valueOf() / 1000)) : undefined;
-            setFilters({ ...next });
-          }}
-        />
-        <Button onClick={() => setFilters({})}>重置</Button>
+      <div className="filter-panel">
+        <div className="filter-chips">
+          <button
+            type="button"
+            className={`chip ${!filters.status ? 'active' : ''}`}
+            onClick={() => setFilters((current) => ({ ...current, status: undefined }))}
+          >
+            全部状态
+          </button>
+          {Object.keys(STATUS_COLORS).map((status) => (
+            <button
+              key={status}
+              type="button"
+              className={`chip ${filters.status === status ? 'active' : ''}`}
+              onClick={() => setFilters((current) => ({ ...current, status }))}
+            >
+              {status}
+            </button>
+          ))}
+        </div>
+        <div className="filter-panel-grid">
+          <div className="filter-field">
+            <span className="meta-label">渠道</span>
+            <Select
+              allowClear
+              placeholder="全部渠道"
+              style={{ width: '100%' }}
+              value={filters.channelId}
+              onChange={(value) => setFilters((current) => ({ ...current, channelId: value }))}
+              options={[
+                ...channels.map((channel) => ({ value: channel.id, label: channel.name })),
+                ...relayPrefixes.map((prefix) => ({ value: `relay:${prefix.prefix}`, label: prefix.label })),
+              ]}
+            />
+          </div>
+          <div className="filter-field">
+            <span className="meta-label">请求类型</span>
+            <Select
+              allowClear
+              placeholder="全部类型"
+              style={{ width: '100%' }}
+              value={filters.stream}
+              onChange={(value) => setFilters((current) => ({ ...current, stream: value }))}
+              options={[
+                { value: 'true', label: '流式' },
+                { value: 'false', label: '非流式' },
+              ]}
+            />
+          </div>
+          <div className="filter-field">
+            <span className="meta-label">时间范围</span>
+            <DatePicker.RangePicker
+              showTime
+              style={{ width: '100%' }}
+              onChange={(range) => {
+                const next = filters as typeof filters & { from?: string; to?: string };
+                next.from = range?.[0] ? String(Math.floor(range[0].valueOf() / 1000)) : undefined;
+                next.to = range?.[1] ? String(Math.floor(range[1].valueOf() / 1000)) : undefined;
+                setFilters({ ...next });
+              }}
+            />
+          </div>
+        </div>
+        <div className="filter-panel-actions">
+          <Button onClick={() => setFilters({})}>重置筛选</Button>
+        </div>
       </div>
 
       <Table

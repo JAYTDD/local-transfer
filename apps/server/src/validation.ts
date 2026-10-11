@@ -66,6 +66,21 @@ export const logQuerySchema = z.object({
   to: z.coerce.number().int().optional(),
 });
 
+/** 订阅中转（relay）模块的开关；两项都可缺省，缺省即不动 */
+export const relaySettingsInputSchema = z
+  .object({
+    enabled: z.boolean().optional(),
+    channels: z
+      .object({
+        trae: z.boolean().optional(),
+        workbuddy: z.boolean().optional(),
+        qoder: z.boolean().optional(),
+      })
+      .strict()
+      .optional(),
+  })
+  .strict();
+
 export function formatZodError(error: z.ZodError): string {
   return error.issues.map((issue) => `${issue.path.join('.') || 'body'}: ${issue.message}`).join('; ');
 }

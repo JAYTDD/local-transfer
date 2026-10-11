@@ -16,6 +16,10 @@
 - `gatewayToken`
 - `connectTimeoutMs`
 - `streamIdleTimeoutMs`
+- `relayEnabled`：订阅中转模块的总开关，`true` / `false`（默认 `true`）
+- `relayChannels`：三个通道开关的 JSON，如 `{"trae":true,"workbuddy":true,"qoder":true}`
+
+布尔写成 `true` / `false`，对象写成 JSON。缺失或解析失败时一律回落到默认值（启用），所以老数据库升级上来不会把模块误关掉。
 
 ## channels
 
@@ -37,10 +41,10 @@
 | 字段 | 类型 | 说明 |
 | --- | --- | --- |
 | `channel_id` | TEXT | 引用 `channels.id` |
-| `model_id` | TEXT | 上游真实模型名，同时作为对外模型 ID |
+| `model_id` | TEXT | 上游真实模型名；对外模型 ID 为 `渠道名/model_id` |
 | `created_at` | INTEGER | 首次添加到该渠道的 Unix 秒 |
 
-主键为 `(channel_id, model_id)`。删除渠道时，该渠道的模型记录会级联删除。`/v1/models` 返回所有渠道模型的去重并集，`created` 取最早添加时间；`/v1/channels/{channelId}/models` 只返回该渠道的模型。
+主键为 `(channel_id, model_id)`。删除渠道时，该渠道的模型记录会级联删除。`/v1/models` 按渠道列出模型（同一模型跨渠道会有多条），`id` 为 `渠道名/模型名`、`owned_by` 为渠道名；`/v1/channels/{channelId}/models` 只返回该渠道的模型，`id` 同样带该渠道名前缀。
 
 ## request_logs
 

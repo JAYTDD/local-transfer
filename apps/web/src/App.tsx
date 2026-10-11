@@ -1,17 +1,19 @@
 import {
+  Boxes,
   Cable,
   ScrollText,
   Settings,
 } from 'lucide-react';
-import { Layout, Menu, Space, Typography } from 'antd';
+import { Layout, Menu } from 'antd';
 import { Navigate, Route, Routes, useLocation, useNavigate } from 'react-router-dom';
 import { BrowserRouter } from 'react-router-dom';
 
 import { ChannelsPage } from './pages/ChannelsPage.js';
 import { LogsPage } from './pages/LogsPage.js';
+import { RelayPage } from './pages/RelayPage.js';
 import { SettingsPage } from './pages/SettingsPage.js';
 
-const { Header, Sider, Content } = Layout;
+const { Content } = Layout;
 
 export function App() {
   return (
@@ -28,43 +30,46 @@ function AdminShell() {
   const selected = location.pathname.split('/')[1] || 'channels';
   return (
     <Layout className="app-shell">
-      <Sider width={228} className="app-sider">
-        <div className="sider-brand">
-          <div className="brand-mark small">AI</div>
-          <div>
-            <div className="sider-title">AiHub</div>
-            <div className="sider-subtitle">LOCAL GATEWAY</div>
+      <header className="app-header">
+        <div className="app-topbar">
+          <div className="topbar-brand">
+            <div className="brand-mark small">AI</div>
+            <div className="topbar-brand-text">
+              <span className="topbar-title">AiHub</span>
+              <span className="topbar-sub">本地 AI 中转网关</span>
+            </div>
+          </div>
+          <div className="topbar-status">
+            <span className="status-dot" />
+            <span>网关运行中</span>
+            <span className="topbar-divider" />
+            <span className="topbar-dim">仅本机管理</span>
           </div>
         </div>
-        <Menu
-          mode="inline"
-          selectedKeys={[selected]}
-          onClick={({ key }) => navigate(`/${key}`)}
-          items={[
-            { key: 'channels', icon: <Cable size={16} />, label: '渠道' },
-            { key: 'logs', icon: <ScrollText size={16} />, label: '日志' },
-            { key: 'settings', icon: <Settings size={16} />, label: '设置' },
-          ]}
-        />
-      </Sider>
-      <Layout>
-        <Header className="app-header">
-          <Space>
-            <span className="status-dot" />
-            <Typography.Text type="secondary">网关运行中</Typography.Text>
-          </Space>
-          <Typography.Text type="secondary">仅本机管理</Typography.Text>
-        </Header>
-        <Content className="app-content">
-          <Routes>
-            <Route path="/" element={<Navigate to="/channels" replace />} />
-            <Route path="/channels" element={<ChannelsPage token={token} />} />
-            <Route path="/logs" element={<LogsPage token={token} />} />
-            <Route path="/settings" element={<SettingsPage token={token} />} />
-            <Route path="*" element={<Navigate to="/channels" replace />} />
-          </Routes>
-        </Content>
-      </Layout>
+        <nav className="app-navbar" aria-label="主导航">
+          <Menu
+            mode="horizontal"
+            selectedKeys={[selected]}
+            onClick={({ key }) => navigate(`/${key}`)}
+            items={[
+              { key: 'channels', icon: <Cable size={15} />, label: '渠道' },
+              { key: 'relay', icon: <Boxes size={15} />, label: '订阅中转' },
+              { key: 'logs', icon: <ScrollText size={15} />, label: '日志' },
+              { key: 'settings', icon: <Settings size={15} />, label: '设置' },
+            ]}
+          />
+        </nav>
+      </header>
+      <Content className="app-content">
+        <Routes>
+          <Route path="/" element={<Navigate to="/channels" replace />} />
+          <Route path="/channels" element={<ChannelsPage token={token} />} />
+          <Route path="/relay" element={<RelayPage token={token} />} />
+          <Route path="/logs" element={<LogsPage token={token} />} />
+          <Route path="/settings" element={<SettingsPage token={token} />} />
+          <Route path="*" element={<Navigate to="/channels" replace />} />
+        </Routes>
+      </Content>
     </Layout>
   );
 }

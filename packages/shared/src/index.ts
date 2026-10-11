@@ -27,7 +27,7 @@ export interface RequestLogDto {
   virtualModel: string;
   channelId: string | null;
   channelName: string | null;
-  protocol: UpstreamProtocol | null;
+  protocol: UpstreamProtocol | 'relay' | null;
   upstreamModel: string | null;
   stream: boolean;
   status: 'ok' | 'error' | 'aborted' | 'upstream_error';
@@ -64,4 +64,35 @@ export interface ApiErrorBody {
       }>;
     };
   };
+}
+
+/** relay 模块（订阅中转）的三个通道开关，每个键控制该通道的国内 + 国际两个变体 */
+export interface RelayChannelToggle {
+  trae: boolean;
+  workbuddy: boolean;
+  qoder: boolean;
+}
+
+/** relay 模块的开关设置 */
+export interface RelaySettingsDto {
+  /** 总开关；关闭时模块完全不装配 */
+  enabled: boolean;
+  channels: RelayChannelToggle;
+}
+
+/** 单个通道前缀（如 `trae/`）的运行状态 */
+export interface RelayPrefixStatusDto {
+  prefix: string;
+  label: string;
+  channel: keyof RelayChannelToggle;
+  models: number;
+  /** 被面板停用的区域为 false；缺省表示启用 */
+  enabled?: boolean;
+  error?: string;
+}
+
+/** relay 模块的完整状态：开关 + 装配结果 */
+export interface RelayStatusDto extends RelaySettingsDto {
+  ready: boolean;
+  prefixes: RelayPrefixStatusDto[];
 }

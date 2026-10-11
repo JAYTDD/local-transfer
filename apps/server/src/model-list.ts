@@ -12,9 +12,9 @@ export interface ModelList {
 
 export function listPublicModels(repository: Repository): ModelList['data'] {
   return repository.listPublicModels().map((model) => ({
-    id: model.id,
+    id: `${model.owner}/${model.id}`,
     object: 'model',
     created: model.createdAt,
-    owned_by: 'aihub',
+    owned_by: model.owner,
   }));
 }

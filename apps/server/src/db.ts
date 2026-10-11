@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 
-import type { UpstreamProtocol } from '@aihub/shared';
+import type { RelayChannelToggle, UpstreamProtocol } from '@aihub/shared';
 
 import type {
   ChannelRecord,
@@ -15,6 +15,38 @@ interface SettingsRecord {
   gatewayToken: string;
   connectTimeoutMs: number;
   streamIdleTimeoutMs: number;
+  relayEnabled: boolean;
+  relayChannels: RelayChannelToggle;
+}
+
+const DEFAULT_RELAY_CHANNELS: RelayChannelToggle = { trae: true, workbuddy: true, qoder: true };
+
+/**
+ * 解析 relay 通道开关。缺键、坏 JSON、非对象一律回落到"全开"——
+ * relay 的默认状态是启用，配置损坏不该把一个能用的模块关掉。
+ */
+function parseRelayChannels(raw: string | undefined): RelayChannelToggle {
+  if (!raw) return { ...DEFAULT_RELAY_CHANNELS };
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+      return { ...DEFAULT_RELAY_CHANNELS };
+    }
+    const record = parsed as Record<string, unknown>;
+    return {
+      trae: record.trae !== false,
+      workbuddy: record.workbuddy !== false,
+      qoder: record.qoder !== false,
+    };
+  } catch {
+    return { ...DEFAULT_RELAY_CHANNELS };
+  }
+}
+
+/** settings 表是 key-value TEXT，对象写成 JSON、布尔写成 true/false */
+function serializeSetting(value: unknown): string {
+  if (typeof value === 'object' && value !== null) return JSON.stringify(value);
+  return String(value);
 }
 
 interface ChannelRow {
@@ -183,6 +215,8 @@ export function createDatabase(databasePath: string): DatabaseHandle {
     ['gatewayToken', randomToken()],
     ['connectTimeoutMs', '10000'],
     ['streamIdleTimeoutMs', '60000'],
+    ['relayEnabled', 'true'],
+    ['relayChannels', JSON.stringify(DEFAULT_RELAY_CHANNELS)],
   ];
   const insertSetting = db.prepare('INSERT OR IGNORE INTO settings(key, value) VALUES (?, ?)');
   for (const [key, value] of defaults) {
@@ -207,6 +241,9 @@ export class Repository {
       gatewayToken: map.get('gatewayToken') ?? '',
       connectTimeoutMs: Number.parseInt(map.get('connectTimeoutMs') ?? '10000', 10),
       streamIdleTimeoutMs: Number.parseInt(map.get('streamIdleTimeoutMs') ?? '60000', 10),
+      // 缺键（老数据库升级上来）时默认启用，与 relayChannels 的回落一致
+      relayEnabled: map.get('relayEnabled') !== 'false',
+      relayChannels: parseRelayChannels(map.get('relayChannels')),
     };
   }
 
@@ -217,7 +254,7 @@ export class Repository {
     `);
     for (const [key, value] of Object.entries(input)) {
       if (value === undefined) continue;
-      statement.run(key, String(value));
+      statement.run(key, serializeSetting(value));
     }
   }
 
@@ -289,15 +326,15 @@ export class Repository {
     return this.attachModels(rows.map(rowToChannel));
   }
 
-  listPublicModels(): Array<{ id: string; createdAt: number }> {
+  listPublicModels(): Array<{ id: string; createdAt: number; owner: string }> {
     return this.db
       .prepare(`
-        SELECT model_id AS id, MIN(created_at) AS createdAt
-        FROM channel_models
-        GROUP BY model_id
-        ORDER BY model_id ASC
+        SELECT cm.model_id AS id, cm.created_at AS createdAt, c.name AS owner
+        FROM channel_models cm
+        JOIN channels c ON c.id = cm.channel_id
+        ORDER BY c.position ASC, c.created_at ASC, c.id ASC, cm.model_id ASC
       `)
-      .all() as unknown as Array<{ id: string; createdAt: number }>;
+      .all() as unknown as Array<{ id: string; createdAt: number; owner: string }>;
   }
 
   createChannel(input: {

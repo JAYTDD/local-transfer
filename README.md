@@ -2,6 +2,8 @@
 
 AiHub 把多个 OpenAI 兼容 chat、OpenAI Responses API 和 Anthropic Messages API 上游聚合成一个本地 OpenAI 兼容入口。每个渠道都有独立的 `baseUrl`，客户端按渠道配置后只会看到该渠道的模型；也可以使用全局入口，模型名在多个渠道重复时会被拒绝。
 
+此外内置了**订阅中转**模块：把本机已登录的 Trae / WorkBuddy / Qoder 三个订阅客户端的额度也接成模型通道，与上面的渠道共用同一个 `/v1` 入口和同一个进程。详见[订阅中转](#订阅中转)。
+
 ## 技术栈
 
 - Node.js 24+
@@ -14,8 +16,11 @@ AiHub 把多个 OpenAI 兼容 chat、OpenAI Responses API 和 Anthropic Messages
 
 ```powershell
 npm install
+npm run sync:relay-deps
 npm run dev
 ```
+
+`sync:relay-deps` 把订阅中转模块的协议层依赖桩同步到它自己的 `node_modules`（首次必跑，改桩后重跑）；跳过它只影响订阅中转，渠道功能照常。
 
 开发模式会同时启动：
 
@@ -31,17 +36,18 @@ npm run build
 npm start
 ```
 
-此时管理端由 Fastify 托管在 `http://127.0.0.1:8787/admin/`。
+此时管理端由 Fastify 托管在 `http://127.0.0.1:8787/admin/`，订阅中转面板已整合进管理端「订阅中转」页。
 
 ## 对外接口
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | `GET` | `/healthz` | 健康检查，无需鉴权 |
-| `GET` | `/v1/models` | 返回全部渠道模型的并集（全局入口） |
-| `POST` | `/v1/chat/completions` | 全局入口，模型只在一个渠道配置时可用 |
+| `GET` | `/v1/models` | 返回全部渠道模型与订阅中转模型的并集（全局入口） |
+| `POST` | `/v1/chat/completions` | 全局入口；接受 `渠道名/模型名`，也兼容不带前缀的旧模型名；带中转前缀时走订阅中转 |
 | `GET` | `/v1/channels/{channelId}/models` | 只返回该渠道配置的模型 |
 | `POST` | `/v1/channels/{channelId}/chat/completions` | 只请求该渠道，支持流式 |
+| `GET` | `/admin/` | 管理端（渠道、日志、设置、订阅中转） |
 
 `/v1/*` 使用 `Authorization: Bearer <gatewayToken>`。管理端只监听 `127.0.0.1`，不额外要求登录令牌。
 
@@ -56,12 +62,12 @@ curl.exe http://127.0.0.1:8787/v1/models `
 curl.exe http://127.0.0.1:8787/v1/chat/completions `
   -H "Authorization: Bearer $env:AIHUB_GATEWAY_TOKEN" `
   -H "Content-Type: application/json" `
-  --data-binary '{"model":"gpt-5","messages":[{"role":"user","content":"你好"}]}'
+  --data-binary '{"model":"渠道名/gpt-5","messages":[{"role":"user","content":"你好"}]}'
 
 curl.exe http://127.0.0.1:8787/v1/channels/<channelId>/chat/completions `
   -H "Authorization: Bearer $env:AIHUB_GATEWAY_TOKEN" `
   -H "Content-Type: application/json" `
-  --data-binary '{"model":"gpt-5","messages":[{"role":"user","content":"你好"}]}'
+  --data-binary '{"model":"渠道名/gpt-5","messages":[{"role":"user","content":"你好"}]}'
 ```
 
 ## 请求范围
@@ -80,7 +86,7 @@ curl.exe http://127.0.0.1:8787/v1/channels/<channelId>/chat/completions `
 
 ## 渠道与转换
 
-- 模型直接挂在渠道下，模型 ID 就是上游真实模型名，网关转发时原样传递。
+- 模型直接挂在渠道下，对外模型 ID 为 `渠道名/上游真实模型名`；网关转发时剥离前缀，上游收到真实模型名。
 - OpenAI 渠道请求发送到 `{baseUrl}/chat/completions`。
 - Responses 渠道请求发送到 `{baseUrl}/responses`，`instructions`、`input`、流式事件和 usage 会转回 chat completions 格式。
 - Responses API 没有等价的 `stop` 字段；请求带 `stop` 且路由到 Responses 渠道时返回 `400`。
@@ -89,13 +95,45 @@ curl.exe http://127.0.0.1:8787/v1/channels/<channelId>/chat/completions `
 - Function calling 会在三种协议间转换：OpenAI/Responses 的 `tools`、`tool_calls`、`function_call` 与 Anthropic 的 `tool_use`、`tool_result` 互相映射，流式工具调用增量同样支持。
 - 每个渠道提供独立的 `/v1/channels/{channelId}` 接入地址，渠道页可以复制完整地址。
 - 请求只命中目标渠道，不再跨渠道故障转移；上游连接失败、429、5xx 或超时都会直接返回统一错误，错误里包含渠道和原因。
-- 全局 `/v1` 入口保留兼容：模型只在一个渠道配置时正常路由，同名模型配置在多个渠道时返回 `400 model_ambiguous`。
-- 停用渠道的模型仍会出现在模型列表中，渠道专属请求返回 `503 channel_unavailable`，全局请求返回 `503 model_unavailable`。
+- 全局 `/v1` 入口带渠道名前缀时直接路由到该渠道；不带前缀时保留兼容逻辑，模型只在一个渠道配置时正常路由，同名模型配置在多个渠道时返回 `400 model_ambiguous`。
+- 停用渠道的模型仍会出现在模型列表中；带前缀或渠道专属请求返回 `503 channel_unavailable`，无前缀全局请求返回 `503 model_unavailable`。
 - 渠道排序只用于管理界面展示，不影响请求路由。
+
+## 订阅中转
+
+内置模块，把三个 DSH 订阅接入插件的协议层（`dsh-connect-trae`、`dsh-workbuddy-connect`、`dsh-qoder-connect`）装配成六个模型通道。凭据直接复用本机已登录的客户端，不需要另填 API Key。
+
+| 前缀 | 通道 | 开关键 |
+| --- | --- | --- |
+| `trae/` | Trae 国内版 | `trae` |
+| `traeg/` | Trae 国际版 | `trae` |
+| `wb/` | WorkBuddy 国内版 | `workbuddy` |
+| `wbai/` | WorkBuddy 国际版 | `workbuddy` |
+| `qoder/` | Qoder 国内版 | `qoder` |
+| `qoderg/` | Qoder 国际版 | `qoder` |
+
+模型名是 **`前缀/模型ID`**，ID 以 `/v1/models` 的实际返回为准（`name` 是给人看的显示名，不能当 ID 用）。带前缀的模型名由本模块优先接管，不进渠道路由。
+
+开关在管理端「订阅中转」页，或：
+
+```powershell
+curl.exe http://127.0.0.1:8787/api/admin/relay `
+  -H "Content-Type: application/json" `
+  -X PUT `
+  --data-binary '{"enabled":true,"channels":{"trae":true,"workbuddy":false,"qoder":true}}'
+```
+
+总开关关闭时模块完全不装配：不读凭据、不启动通道、不拉目录，`/v1/models` 不含任何前缀模型，`/panel/api/*` 返回 503。单个通道关闭时它的两个变体一起下线。改动即时生效。
+
+控制面板已整合进管理端「订阅中转」页，菜单在页面顶部，含总览、Trae、WorkBuddy、Qoder、设置五个标签页；总开关与三个通道开关在「设置」里，额度、签到、账号切换、模型启停、推理探针在各通道页里。其中「领取签到」与「探针」是**真会发上游请求、消耗订阅额度**的操作。请求日志统一写入 AiHub「日志」页（渠道筛选为 `relay:{prefix}`）。
+
+本模块的状态与凭据处理独立于 AiHub 本体：状态落在 `~/.dsh/local-relay/`，请求日志同时写入 AiHub 的 `request_logs` 表（内存环形缓冲保留用于面板诊断），模型不进 `channel_models`。模块细节见 [packages/relay/README.md](packages/relay/README.md)。
 
 ## 数据
 
 默认数据库为项目内 `data/aihub.sqlite`，可用 `AIHUB_DATA_DIR` 覆盖。所有渠道、渠道模型、设置和请求日志都持久化在 SQLite 中。
+
+`settings` 表除 gateway token 与两个超时外，还保存订阅中转的开关：`relayEnabled`（总开关）与 `relayChannels`（三个通道的 JSON）。默认都是启用。
 
 服务默认监听 `127.0.0.1:8787`，可用以下环境变量覆盖：
 
@@ -111,7 +149,9 @@ curl.exe http://127.0.0.1:8787/v1/channels/<channelId>/chat/completions `
 npm test
 ```
 
-测试覆盖请求与响应转换、OpenAI/Anthropic 流式转换、渠道路由、客户端断连、管理 API、鉴权与持久化。
+一次跑三套：AiHub 后端与前端（Vitest）、订阅中转模块（`node --test`，自带 18 个测试文件）。订阅中转那套里有对协议层的裸包名 import，会先自动同步依赖桩，所以首次跑会稍慢。
+
+测试覆盖请求与响应转换、OpenAI/Anthropic 流式转换、渠道路由、客户端断连、管理 API、鉴权与持久化，以及订阅中转的模型路由、面板数据层与出站兼容处理。
 
 ## 非目标
 

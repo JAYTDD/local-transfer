@@ -9,13 +9,15 @@
   "workspaces": [
     "apps/server",
     "apps/web",
-    "packages/shared"
+    "packages/shared",
+    "packages/relay"
   ],
   "scripts": {
     "dev": "npm run build -w @aihub/shared && concurrently -k -n server,web -c cyan,magenta \"npm run dev -w @aihub/server\" \"npm run dev -w @aihub/web\"",
     "build": "npm run build -w @aihub/shared && npm run build -w @aihub/server && npm run build -w @aihub/web",
     "start": "npm run start -w @aihub/server",
-    "test": "npm run test -w @aihub/shared && npm run test -w @aihub/server && npm run test -w @aihub/web"
+    "test": "npm run test -w @aihub/shared && npm run test -w @aihub/server && npm run test -w @aihub/relay && npm run test -w @aihub/web",
+    "sync:relay-deps": "node packages/relay/scripts/sync-deps.mjs"
   },
   "devDependencies": {
     "concurrently": "^9.2.1",

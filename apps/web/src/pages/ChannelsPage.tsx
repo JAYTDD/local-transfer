@@ -36,7 +36,7 @@ import {
 } from '@dnd-kit/core';
 import {
   arrayMove,
-  rectSortingStrategy,
+  verticalListSortingStrategy,
   SortableContext,
   sortableKeyboardCoordinates,
   useSortable,
@@ -156,8 +156,9 @@ function SortableChannelCard({
     >
       <Card
         className={`channel-card ${channel.enabled ? '' : 'is-disabled'}`}
-        title={
-          <Space>
+      >
+        <div className="channel-row">
+          <div className="channel-row-identity">
             <Button
               type="text"
               size="small"
@@ -168,108 +169,115 @@ function SortableChannelCard({
               {...listeners}
             />
             <span className="status-dot" data-enabled={channel.enabled} />
-            <span>{channel.name}</span>
-          </Space>
-        }
-        extra={<Tag color={PROTOCOL_COLORS[channel.protocol]}>{PROTOCOL_LABELS[channel.protocol]}</Tag>}
-        actions={[
-          <Tooltip title="启用或停用" key="toggle">
-            <Switch
-              size="small"
-              checked={channel.enabled}
-              onChange={(checked) => onToggle(channel, checked)}
-            />
-          </Tooltip>,
-          <Tooltip title="测试连通性" key="test">
-            <Button
-              type="text"
-              aria-label={`测试 ${channel.name}`}
-              icon={<Activity size={16} />}
-              loading={testing}
-              onClick={() => onTest(channel)}
-            />
-          </Tooltip>,
-          <Tooltip title="编辑" key="edit">
-            <Button
-              type="text"
-              aria-label={`编辑 ${channel.name}`}
-              icon={<Pencil size={16} />}
-              onClick={() => onEdit(channel)}
-            />
-          </Tooltip>,
-          <Tooltip title="复制" key="duplicate">
-            <Button
-              type="text"
-              aria-label={`复制 ${channel.name}`}
-              icon={<Copy size={16} />}
-              onClick={() => onDuplicate(channel)}
-            />
-          </Tooltip>,
-          <Tooltip title="删除" key="delete">
-            <Button
-              type="text"
-              danger
-              aria-label={`删除 ${channel.name}`}
-              icon={<Trash2 size={16} />}
-              onClick={() => onRemove(channel)}
-            />
-          </Tooltip>,
-        ]}
-      >
-        <div className="channel-meta">
-          <div>
-            <span className="meta-label">BASE URL</span>
-            <span className="mono">{channel.baseUrl}</span>
+            <div className="channel-row-title">
+              <span className="channel-name">{channel.name}</span>
+              <span className="channel-row-sub">
+                {channel.models.length} 个模型 · {channel.enabled ? '运行中' : '已停用'}
+              </span>
+            </div>
+            <Tag color={PROTOCOL_COLORS[channel.protocol]}>{PROTOCOL_LABELS[channel.protocol]}</Tag>
           </div>
-          <div>
-            <span className="meta-label">ENDPOINT</span>
-            <Space size={4}>
-              <span className="mono">{endpointUrl}</span>
-              <Tooltip title="复制接入地址">
-                <Button
-                  type="text"
+
+          <div className="channel-row-meta">
+            <div className="channel-meta-item">
+              <span className="meta-label">BASE URL</span>
+              <span className="mono">{channel.baseUrl}</span>
+            </div>
+            <div className="channel-meta-item">
+              <span className="meta-label">ENDPOINT</span>
+              <Space size={4}>
+                <span className="mono">{endpointUrl}</span>
+                <Tooltip title="复制接入地址">
+                  <Button
+                    type="text"
+                    size="small"
+                    aria-label={`复制 ${channel.name} 接入地址`}
+                    icon={<Copy size={14} />}
+                    onClick={() => {
+                      const clipboard = navigator.clipboard;
+                      if (!clipboard) {
+                        message.error('当前环境不支持剪贴板');
+                        return;
+                      }
+                      void clipboard.writeText(endpointUrl).then(
+                        () => message.success('接入地址已复制'),
+                        () => message.error('复制失败'),
+                      );
+                    }}
+                  />
+                </Tooltip>
+              </Space>
+            </div>
+            <div className="channel-meta-item">
+              <span className="meta-label">KEY</span>
+              <span className="mono">{channel.apiKeyMasked}</span>
+            </div>
+            <div className="channel-meta-item">
+              <span className="meta-label">MAX TOKENS</span>
+              <span className="mono">{channel.defaultMaxTokens}</span>
+            </div>
+          </div>
+
+          <div className="channel-row-side">
+            <div className="channel-row-models">
+              {channel.models.length ? (
+                <Space size={4} wrap>
+                  {channel.models.slice(0, 3).map((model) => (
+                    <Tag key={model}>{model}</Tag>
+                  ))}
+                  {channel.models.length > 3 ? (
+                    <Tooltip title={channel.models.slice(3).join(', ')}>
+                      <Tag>+{channel.models.length - 3}</Tag>
+                    </Tooltip>
+                  ) : null}
+                </Space>
+              ) : (
+                <Typography.Text type="secondary">未添加模型</Typography.Text>
+              )}
+            </div>
+            <div className="channel-row-actions">
+              <Tooltip title="启用或停用">
+                <Switch
                   size="small"
-                  aria-label={`复制 ${channel.name} 接入地址`}
-                  icon={<Copy size={14} />}
-                  onClick={() => {
-                    const clipboard = navigator.clipboard;
-                    if (!clipboard) {
-                      message.error('当前环境不支持剪贴板');
-                      return;
-                    }
-                    void clipboard.writeText(endpointUrl).then(
-                      () => message.success('接入地址已复制'),
-                      () => message.error('复制失败'),
-                    );
-                  }}
+                  checked={channel.enabled}
+                  onChange={(checked) => onToggle(channel, checked)}
                 />
               </Tooltip>
-            </Space>
-          </div>
-          <div>
-            <span className="meta-label">KEY</span>
-            <span className="mono">{channel.apiKeyMasked}</span>
-          </div>
-          <div>
-            <span className="meta-label">DEFAULT MAX TOKENS</span>
-            <span>{channel.defaultMaxTokens}</span>
-          </div>
-          <div>
-            <span className="meta-label">MODELS · {channel.models.length}</span>
-            {channel.models.length ? (
-              <Space size={4} wrap>
-                {channel.models.slice(0, 5).map((model) => (
-                  <Tag key={model}>{model}</Tag>
-                ))}
-                {channel.models.length > 5 ? (
-                  <Tooltip title={channel.models.slice(5).join(', ')}>
-                    <Tag>+{channel.models.length - 5}</Tag>
-                  </Tooltip>
-                ) : null}
-              </Space>
-            ) : (
-              <Typography.Text type="secondary">未添加模型</Typography.Text>
-            )}
+              <Tooltip title="测试连通性">
+                <Button
+                  type="text"
+                  aria-label={`测试 ${channel.name}`}
+                  icon={<Activity size={16} />}
+                  loading={testing}
+                  onClick={() => onTest(channel)}
+                />
+              </Tooltip>
+              <Tooltip title="编辑">
+                <Button
+                  type="text"
+                  aria-label={`编辑 ${channel.name}`}
+                  icon={<Pencil size={16} />}
+                  onClick={() => onEdit(channel)}
+                />
+              </Tooltip>
+              <Tooltip title="复制">
+                <Button
+                  type="text"
+                  aria-label={`复制 ${channel.name}`}
+                  icon={<Copy size={16} />}
+                  onClick={() => onDuplicate(channel)}
+                />
+              </Tooltip>
+              <Tooltip title="删除">
+                <Button
+                  type="text"
+                  danger
+                  aria-label={`删除 ${channel.name}`}
+                  icon={<Trash2 size={16} />}
+                  onClick={() => onRemove(channel)}
+                />
+              </Tooltip>
+            </div>
           </div>
         </div>
       </Card>
@@ -497,6 +505,25 @@ export function ChannelsPage({ token }: { token: string }) {
         </Space>
       </div>
 
+      <div className="stat-strip">
+        <div className="stat-item">
+          <span className="stat-value">{channels.length}</span>
+          <span className="stat-label">渠道总数</span>
+        </div>
+        <div className="stat-item">
+          <span className="stat-value">{channels.filter((item) => item.enabled).length}</span>
+          <span className="stat-label">启用中</span>
+        </div>
+        <div className="stat-item">
+          <span className="stat-value">{channels.reduce((sum, item) => sum + item.models.length, 0)}</span>
+          <span className="stat-label">模型总数</span>
+        </div>
+        <div className="stat-item">
+          <span className="stat-value">{new Set(channels.map((item) => item.protocol)).size}</span>
+          <span className="stat-label">协议类型</span>
+        </div>
+      </div>
+
       {channels.length === 0 && !loading ? (
         <Empty description="还没有配置渠道" />
       ) : (
@@ -505,8 +532,8 @@ export function ChannelsPage({ token }: { token: string }) {
           collisionDetection={closestCenter}
           onDragEnd={(event) => void handleDragEnd(event)}
         >
-          <SortableContext items={channels.map((channel) => channel.id)} strategy={rectSortingStrategy}>
-            <div className="channel-grid">
+          <SortableContext items={channels.map((channel) => channel.id)} strategy={verticalListSortingStrategy}>
+            <div className="channel-list">
               {channels.map((channel) => (
                 <SortableChannelCard
                   key={channel.id}

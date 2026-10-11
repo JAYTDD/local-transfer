@@ -6,7 +6,9 @@ import type { ReactNode } from 'react';
 import { getData, mutateData } from './api.js';
 import { ChannelsPage } from './pages/ChannelsPage.js';
 import { LogsPage } from './pages/LogsPage.js';
+import { RelayPage } from './pages/RelayPage.js';
 import { SettingsPage } from './pages/SettingsPage.js';
+import WorkBuddyPage from './relay-panel/pages/WorkBuddyPage.jsx';
 
 vi.mock('./api.js', () => ({
   getData: vi.fn(),
@@ -34,6 +36,7 @@ function renderPage(page: ReactNode) {
 afterEach(() => {
   cleanup();
   vi.clearAllMocks();
+  vi.unstubAllGlobals();
 });
 
 describe('admin pages', () => {
@@ -95,7 +98,7 @@ describe('admin pages', () => {
         expect.objectContaining({ models: ['m1', 'm2'] }),
       ),
     );
-  });
+  }, 10000);
 
   it('tests a channel from the card', async () => {
     vi.mocked(getData).mockResolvedValue([channel]);
@@ -154,6 +157,14 @@ describe('admin pages', () => {
           },
         ];
       }
+      if (path === '/api/admin/relay') {
+        return {
+          enabled: false,
+          channels: { trae: false, workbuddy: false, qoder: false },
+          ready: false,
+          prefixes: [],
+        };
+      }
       return [channel];
     });
     renderPage(<LogsPage token="admin" />);
@@ -182,6 +193,14 @@ describe('admin pages', () => {
           },
         ];
       }
+      if (path === '/api/admin/relay') {
+        return {
+          enabled: false,
+          channels: { trae: false, workbuddy: false, qoder: false },
+          ready: false,
+          prefixes: [],
+        };
+      }
       return [channel];
     });
     renderPage(<LogsPage token="admin" />);
@@ -189,6 +208,134 @@ describe('admin pages', () => {
     expect(await screen.findByText('请求详情')).toBeInTheDocument();
     expect((await screen.findAllByText('upstream failed: 500')).length).toBeGreaterThanOrEqual(2);
   });
+
+  it('lists relay channels in the log channel filter', async () => {
+    vi.mocked(getData).mockImplementation(async (path: string) => {
+      if (path.startsWith('/api/admin/logs')) return [];
+      if (path === '/api/admin/relay') {
+        return {
+          enabled: true,
+          channels: { trae: true, workbuddy: false, qoder: false },
+          ready: true,
+          prefixes: [{ prefix: 'trae', label: 'Trae 国内版', channel: 'trae', models: 3 }],
+        };
+      }
+      return [channel];
+    });
+    renderPage(<LogsPage token="admin" />);
+    fireEvent.mouseDown(screen.getAllByRole('combobox')[0]!);
+    expect(await screen.findByTitle('Trae 国内版')).toBeInTheDocument();
+  });
+
+  it('renders relay tabs without the merged log tab', async () => {
+    vi.mocked(getData).mockResolvedValue({
+      enabled: true,
+      channels: { trae: false, workbuddy: false, qoder: false },
+      ready: true,
+      prefixes: [],
+    });
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(
+        async () =>
+          new Response(
+            JSON.stringify({ ok: true, endpoint: 'http://127.0.0.1:8787/v1', providers: [] }),
+            { status: 200, headers: { 'content-type': 'application/json' } },
+          ),
+      ),
+    );
+    renderPage(<RelayPage token="admin" />);
+    expect(await screen.findByText('总览')).toBeInTheDocument();
+    expect(screen.getByText('设置')).toBeInTheDocument();
+    expect(screen.queryByRole('tab', { name: '日志' })).not.toBeInTheDocument();
+  });
+
+  it('toggles a workbuddy model without refetching the whole document', async () => {
+    const calls: string[] = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        calls.push(`${init?.method ?? 'GET'} ${url}`);
+        const body = url.includes('/panel/workbuddy/control')
+          ? { state: 'updated', disabledModels: ['m1'] }
+          : {
+              variants: {
+                cn: {
+                  status: 'signed-in',
+                  variant: 'cn',
+                  models: [{ id: 'm1', name: 'M1' }],
+                  disabledModels: [],
+                  maximumContext: { supported: false },
+                  probeConsent: false,
+                },
+              },
+            };
+        return new Response(JSON.stringify(body), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }),
+    );
+    renderPage(<WorkBuddyPage variant="cn" onVariant={() => {}} onChannelChanged={() => {}} />);
+    fireEvent.click(await screen.findByRole('switch', { name: '启用 m1' }));
+    await waitFor(() =>
+      expect(screen.getByRole('switch', { name: '启用 m1' })).toHaveAttribute('aria-checked', 'false'),
+    );
+    expect(calls.filter((call) => call.startsWith('GET') && call.includes('/panel/workbuddy?'))).toHaveLength(1);
+    expect(calls.some((call) => call.startsWith('POST') && call.includes('/panel/workbuddy/control'))).toBe(true);
+  });
+
+  it('keeps the workbuddy pane mounted when toggling a model inside relay tabs', async () => {
+    const calls: string[] = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        calls.push(`${init?.method ?? 'GET'} ${url}`);
+        let body: unknown = {};
+        if (url.includes('/panel/workbuddy/control')) {
+          body = { state: 'updated', disabledModels: ['m1'] };
+        } else if (url.includes('/panel/workbuddy')) {
+          body = {
+            variants: {
+              cn: {
+                status: 'signed-in',
+                variant: 'cn',
+                models: [{ id: 'm1', name: 'M1' }],
+                disabledModels: [],
+                maximumContext: { supported: false },
+                probeConsent: false,
+              },
+            },
+          };
+        } else if (url.includes('/panel/health')) {
+          body = { ok: true, endpoint: 'http://127.0.0.1:8787/v1', providers: [] };
+        } else if (url.includes('/panel/trae')) {
+          body = { regions: { cn: { status: 'signed-out' }, ai: { status: 'signed-out' } } };
+        } else if (url.includes('/panel/qoder')) {
+          body = { variants: { cn: { status: 'signed-out' }, global: { status: 'signed-out' } } };
+        }
+        return new Response(JSON.stringify(body), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }),
+    );
+    vi.mocked(getData).mockImplementation(async (path: string) => {
+      if (path === '/api/admin/relay') {
+        return { enabled: true, channels: { trae: false, workbuddy: true, qoder: false }, ready: true, prefixes: [] };
+      }
+      return [];
+    });
+    renderPage(<RelayPage token="admin" />);
+    fireEvent.click(await screen.findByRole('tab', { name: 'WorkBuddy' }));
+    fireEvent.click(await screen.findByRole('switch', { name: '启用 m1' }));
+    await waitFor(() =>
+      expect(screen.getByRole('switch', { name: '启用 m1' })).toHaveAttribute('aria-checked', 'false'),
+    );
+    expect(calls.filter((call) => call.startsWith('GET') && call.includes('/panel/workbuddy?'))).toHaveLength(1);
+  }, 10000);
 
   it('renders settings and client access info', async () => {
     vi.mocked(getData).mockImplementation(async (path: string) => {

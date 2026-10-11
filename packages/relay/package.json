@@ -1,0 +1,19 @@
+{
+  "name": "@aihub/relay",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "description": "把 DSH 三个订阅接入插件（Trae / WorkBuddy / Qoder）的协议层装配成 AiHub 的内置模型通道模块",
+  "engines": {
+    "node": ">=20.3.0"
+  },
+  "main": "src/gateway.mjs",
+  "exports": {
+    ".": "./src/gateway.mjs"
+  },
+  "scripts": {
+    "test": "node scripts/sync-deps.mjs && node --test test/*.test.js",
+    "sync:deps": "node scripts/sync-deps.mjs"
+  }
+}

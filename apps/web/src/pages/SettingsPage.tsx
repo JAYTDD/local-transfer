@@ -76,8 +76,9 @@ export function SettingsPage({ token }: { token: string }) {
         </div>
       </div>
 
-      <Card loading={loading} className="settings-card">
-        <Form form={form} layout="vertical" requiredMark={false}>
+      <Form form={form} layout="vertical" requiredMark={false}>
+        <div className="settings-layout">
+        <Card title="访问令牌" loading={loading} className="settings-card">
           <Form.Item
             name="gatewayToken"
             label="网关 Bearer Token"
@@ -86,31 +87,28 @@ export function SettingsPage({ token }: { token: string }) {
           >
             <Input.Password />
           </Form.Item>
-          <div className="settings-grid">
-            <Form.Item
-              name="connectTimeoutMs"
-              label="连接超时（毫秒）"
-              extra="覆盖连接建立、响应头和首个流式片段。"
-              rules={[{ required: true }]}
-            >
-              <InputNumber min={100} max={300000} style={{ width: '100%' }} />
-            </Form.Item>
-            <Form.Item
-              name="streamIdleTimeoutMs"
-              label="流式空闲超时（毫秒）"
-              extra="开始输出后，上游两个片段之间的最大间隔。"
-              rules={[{ required: true }]}
-            >
-              <InputNumber min={100} max={3600000} style={{ width: '100%' }} />
-            </Form.Item>
-          </div>
-          <Button type="primary" icon={<Save size={16} />} loading={saving} onClick={() => void save()}>
-            保存设置
-          </Button>
-        </Form>
-      </Card>
+        </Card>
 
-      <Card title="客户端接入" className="settings-card">
+        <Card title="超时策略" loading={loading} className="settings-card">
+          <Form.Item
+            name="connectTimeoutMs"
+            label="连接超时（毫秒）"
+            extra="覆盖连接建立、响应头和首个流式片段。"
+            rules={[{ required: true }]}
+          >
+            <InputNumber min={100} max={300000} style={{ width: '100%' }} />
+          </Form.Item>
+          <Form.Item
+            name="streamIdleTimeoutMs"
+            label="流式空闲超时（毫秒）"
+            extra="开始输出后，上游两个片段之间的最大间隔。"
+            rules={[{ required: true }]}
+          >
+            <InputNumber min={100} max={3600000} style={{ width: '100%' }} />
+          </Form.Item>
+        </Card>
+
+      <Card title="客户端接入" className="settings-card settings-card-wide">
         <div className="settings-rows">
           <div className="settings-row">
             <span className="meta-label">BASE URL</span>
@@ -161,6 +159,13 @@ export function SettingsPage({ token }: { token: string }) {
           </div>
         </div>
       </Card>
+        </div>
+        <div className="settings-actions">
+          <Button type="primary" icon={<Save size={16} />} loading={saving} onClick={() => void save()}>
+            保存设置
+          </Button>
+        </div>
+      </Form>
     </div>
   );
 }

@@ -28,6 +28,30 @@ function safeErrorMessage(error: unknown): string {
   return (error instanceof Error ? error.message : String(error)).slice(0, 500);
 }
 
+/** 渠道独立端点：客户端可带或不带该渠道前缀，统一剥离后使用真实模型名 */
+function stripChannelPrefix(model: string, channelName: string): string {
+  const prefix = `${channelName}/`;
+  return model.startsWith(prefix) ? model.slice(prefix.length) : model;
+}
+
+/** 全局端点：按渠道名解析 `渠道名/模型名`；渠道名互为前缀时取最长匹配 */
+function resolveChannelPrefix(
+  model: string,
+  channels: ChannelRecord[],
+): { channel: ChannelRecord; upstreamModel: string } | null {
+  let best: { channel: ChannelRecord; upstreamModel: string } | null = null;
+  let bestPrefixLength = 0;
+  for (const channel of channels) {
+    const prefix = `${channel.name}/`;
+    if (!model.startsWith(prefix)) continue;
+    const upstreamModel = model.slice(prefix.length);
+    if (!upstreamModel || prefix.length <= bestPrefixLength) continue;
+    best = { channel, upstreamModel };
+    bestPrefixLength = prefix.length;
+  }
+  return best;
+}
+
 function isRetryableStatus(status: number): boolean {
   return status === 429 || status >= 500;
 }
@@ -97,6 +121,7 @@ export async function handleChatCompletions(
   }
 
   let channel: ChannelRecord;
+  let upstreamModel = body.model;
   if (options.channelId) {
     const selected = repository.getChannel(options.channelId);
     if (!selected) {
@@ -110,7 +135,8 @@ export async function handleChatCompletions(
       );
       return;
     }
-    if (!selected.models.includes(body.model)) {
+    upstreamModel = stripChannelPrefix(body.model, selected.name);
+    if (!upstreamModel || !selected.models.includes(upstreamModel)) {
       sendOpenAiError(
         reply,
         404,
@@ -129,7 +155,7 @@ export async function handleChatCompletions(
         channelId: selected.id,
         channelName: selected.name,
         protocol: selected.protocol,
-        upstreamModel: body.model,
+        upstreamModel,
         stream: body.stream,
         status: 'error',
         httpStatus: 503,
@@ -140,39 +166,73 @@ export async function handleChatCompletions(
     }
     channel = selected;
   } else {
-    const configured = repository.listChannelsByModel(body.model);
-    if (configured.length === 0) {
-      sendOpenAiError(reply, 404, `Model "${body.model}" was not found`, 'model_not_found', 'invalid_request_error', 'model');
-      return;
-    }
-    if (configured.length > 1) {
-      sendOpenAiError(
-        reply,
-        400,
-        `Model "${body.model}" is configured on multiple channels; use a channel-specific endpoint`,
-        'model_ambiguous',
-        'invalid_request_error',
-        'model',
-      );
-      return;
-    }
-    channel = configured[0]!;
-    if (!channel.enabled) {
-      sendOpenAiError(reply, 503, `Model "${body.model}" has no enabled channel`, 'model_unavailable', 'server_error');
-      repository.insertLog({
-        createdAt: Math.floor(Date.now() / 1000),
-        virtualModel: body.model,
-        channelId: channel.id,
-        channelName: channel.name,
-        protocol: channel.protocol,
-        upstreamModel: body.model,
-        stream: body.stream,
-        status: 'error',
-        httpStatus: 503,
-        durationMs: Date.now() - startedAt,
-        errorSummary: 'no enabled channel',
-      });
-      return;
+    const prefixed = resolveChannelPrefix(body.model, repository.listChannels());
+    if (prefixed) {
+      channel = prefixed.channel;
+      upstreamModel = prefixed.upstreamModel;
+      if (!channel.models.includes(upstreamModel)) {
+        sendOpenAiError(
+          reply,
+          404,
+          `Model "${body.model}" is not configured on channel "${channel.name}"`,
+          'model_not_found',
+          'invalid_request_error',
+          'model',
+        );
+        return;
+      }
+      if (!channel.enabled) {
+        sendOpenAiError(reply, 503, `Channel "${channel.name}" is disabled`, 'channel_unavailable', 'server_error');
+        repository.insertLog({
+          createdAt: Math.floor(Date.now() / 1000),
+          virtualModel: body.model,
+          channelId: channel.id,
+          channelName: channel.name,
+          protocol: channel.protocol,
+          upstreamModel,
+          stream: body.stream,
+          status: 'error',
+          httpStatus: 503,
+          durationMs: Date.now() - startedAt,
+          errorSummary: 'channel disabled',
+        });
+        return;
+      }
+    } else {
+      const configured = repository.listChannelsByModel(body.model);
+      if (configured.length === 0) {
+        sendOpenAiError(reply, 404, `Model "${body.model}" was not found`, 'model_not_found', 'invalid_request_error', 'model');
+        return;
+      }
+      if (configured.length > 1) {
+        sendOpenAiError(
+          reply,
+          400,
+          `Model "${body.model}" is configured on multiple channels; use a channel-specific endpoint`,
+          'model_ambiguous',
+          'invalid_request_error',
+          'model',
+        );
+        return;
+      }
+      channel = configured[0]!;
+      if (!channel.enabled) {
+        sendOpenAiError(reply, 503, `Model "${body.model}" has no enabled channel`, 'model_unavailable', 'server_error');
+        repository.insertLog({
+          createdAt: Math.floor(Date.now() / 1000),
+          virtualModel: body.model,
+          channelId: channel.id,
+          channelName: channel.name,
+          protocol: channel.protocol,
+          upstreamModel,
+          stream: body.stream,
+          status: 'error',
+          httpStatus: 503,
+          durationMs: Date.now() - startedAt,
+          errorSummary: 'no enabled channel',
+        });
+        return;
+      }
     }
   }
 
@@ -206,10 +266,10 @@ export async function handleChatCompletions(
       try {
         upstreamRequest =
           channel.protocol === 'anthropic'
-            ? toAnthropicRequest(body, body.model, channel.defaultMaxTokens)
+            ? toAnthropicRequest(body, upstreamModel, channel.defaultMaxTokens)
             : channel.protocol === 'responses'
-              ? toResponsesRequest(body, body.model, channel.defaultMaxTokens)
-              : toOpenAiRequest(body, body.model, channel.defaultMaxTokens);
+              ? toResponsesRequest(body, upstreamModel, channel.defaultMaxTokens)
+              : toOpenAiRequest(body, upstreamModel, channel.defaultMaxTokens);
       } catch (error) {
         finish();
         const unsupported = error instanceof UnsupportedRequestError;
@@ -227,7 +287,7 @@ export async function handleChatCompletions(
           channelId: channel.id,
           channelName: channel.name,
           protocol: channel.protocol,
-          upstreamModel: body.model,
+          upstreamModel,
           stream: body.stream,
           status: 'error',
           httpStatus: null,
@@ -266,7 +326,7 @@ export async function handleChatCompletions(
             channelId: channel.id,
             channelName: channel.name,
             protocol: channel.protocol,
-            upstreamModel: body.model,
+            upstreamModel,
             stream: body.stream,
             status: 'aborted',
             httpStatus: null,
@@ -300,7 +360,7 @@ export async function handleChatCompletions(
           channelId: channel.id,
           channelName: channel.name,
           protocol: channel.protocol,
-          upstreamModel: body.model,
+          upstreamModel,
           stream: body.stream,
           status: 'error',
           httpStatus: null,
@@ -338,7 +398,7 @@ export async function handleChatCompletions(
           channelId: channel.id,
           channelName: channel.name,
           protocol: channel.protocol,
-          upstreamModel: body.model,
+          upstreamModel,
           stream: body.stream,
           status: 'upstream_error',
           httpStatus: response.status,
@@ -376,7 +436,7 @@ export async function handleChatCompletions(
           channelId: channel.id,
           channelName: channel.name,
           protocol: channel.protocol,
-          upstreamModel: body.model,
+          upstreamModel,
           stream: body.stream,
           status: 'upstream_error',
           httpStatus: response.status,
@@ -399,7 +459,7 @@ export async function handleChatCompletions(
               channelId: channel.id,
               channelName: channel.name,
               protocol: channel.protocol,
-              upstreamModel: body.model,
+              upstreamModel,
               stream: false,
               status: 'aborted',
               httpStatus: response.status,
@@ -434,7 +494,7 @@ export async function handleChatCompletions(
             channelId: channel.id,
             channelName: channel.name,
             protocol: channel.protocol,
-            upstreamModel: body.model,
+            upstreamModel,
             stream: false,
             status: 'error',
             httpStatus: response.status,
@@ -459,7 +519,7 @@ export async function handleChatCompletions(
             channelId: channel.id,
             channelName: channel.name,
             protocol: channel.protocol,
-            upstreamModel: body.model,
+            upstreamModel,
             stream: false,
             status: 'ok',
             httpStatus: response.status,
@@ -494,7 +554,7 @@ export async function handleChatCompletions(
             channelId: channel.id,
             channelName: channel.name,
             protocol: channel.protocol,
-            upstreamModel: body.model,
+            upstreamModel,
             stream: false,
             status: 'upstream_error',
             httpStatus: response.status,
@@ -532,7 +592,7 @@ export async function handleChatCompletions(
           channelId: channel.id,
           channelName: channel.name,
           protocol: channel.protocol,
-          upstreamModel: body.model,
+          upstreamModel,
           stream: body.stream,
           status: 'error',
           httpStatus: response.status,
@@ -570,7 +630,7 @@ export async function handleChatCompletions(
           channelId: channel.id,
           channelName: channel.name,
           protocol: channel.protocol,
-          upstreamModel: body.model,
+          upstreamModel,
           stream: true,
           status: 'aborted',
           httpStatus: response.status,
@@ -606,7 +666,7 @@ export async function handleChatCompletions(
           channelId: channel.id,
           channelName: channel.name,
           protocol: channel.protocol,
-          upstreamModel: body.model,
+          upstreamModel,
           stream: true,
           status: 'error',
           httpStatus: response.status,
@@ -629,7 +689,7 @@ export async function handleChatCompletions(
           channelId: channel.id,
           channelName: channel.name,
           protocol: channel.protocol,
-          upstreamModel: body.model,
+          upstreamModel,
           stream: true,
           status: 'upstream_error',
           httpStatus: response.status,
@@ -646,7 +706,7 @@ export async function handleChatCompletions(
         channelId: channel.id,
         channelName: channel.name,
         protocol: channel.protocol,
-        upstreamModel: body.model,
+        upstreamModel,
         stream: true,
         status: 'ok',
         httpStatus: response.status,

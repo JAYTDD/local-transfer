@@ -1,4 +1,7 @@
 node_modules/
+# relay 的 shims/node_modules 是入库的核心资产（提取来的协议层 + DSH 依赖桩，
+# 需要能 diff 审查），必须从上面的通配规则里排除回来。
+!packages/relay/shims/node_modules/
 dist/
 data/
 *.log
