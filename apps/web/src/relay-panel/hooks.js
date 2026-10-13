@@ -8,6 +8,11 @@ import { useCallback, useEffect, useRef, useState } from 'react';
  */
 const documents = new Map();
 
+/** 测试用：清掉跨挂载缓存，避免上一例的文档漏到下一例。 */
+export function clearDocumentCache() {
+  documents.clear();
+}
+
 function initial(cacheKey) {
   const hit = cacheKey === undefined ? undefined : documents.get(cacheKey);
   return { cacheKey, data: hit ?? null, loading: hit === undefined, error: null };

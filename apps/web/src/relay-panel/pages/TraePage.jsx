@@ -1,4 +1,5 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
+import { Select } from 'antd';
 import ChannelLayout from '../components/ChannelLayout.jsx';
 import CreditsPanel from '../components/CreditsPanel.jsx';
 import ModelTable from '../components/ModelTable.jsx';
@@ -12,6 +13,41 @@ const REGIONS = [
   { key: 'ai', label: '国际版' },
 ];
 
+const PROBE_LABEL = {
+  available: '可用',
+  gated: '需付费',
+  unsupported: '不提供',
+  rate_limited: '限流',
+  auth: '登录失效',
+  unknown: '未能判断',
+};
+
+function expiryNotice(expiry) {
+  if (!expiry) return null;
+  if (expiry.expired?.packs > 0) {
+    return { kind: 'err', text: `有 ${expiry.expired.packs} 笔共 ${fmtNum(expiry.expired.total)} 积分已过期，但余额还在` };
+  }
+  const soon = expiry.within24h?.packs > 0
+    ? { bucket: expiry.within24h, label: '24 小时内' }
+    : expiry.within3d?.packs > 0
+      ? { bucket: expiry.within3d, label: '3 天内' }
+      : expiry.within7d?.packs > 0
+        ? { bucket: expiry.within7d, label: '7 天内' }
+        : null;
+  if (!soon) return null;
+  const when = soon.bucket.earliestExpiresAtMs ? `，最早 ${fmtTime(soon.bucket.earliestExpiresAtMs)}` : '';
+  return { kind: 'info', text: `有 ${soon.bucket.packs} 笔共 ${fmtNum(soon.bucket.total)} 积分将在${soon.label}到期${when}` };
+}
+
+function planLabel(pay) {
+  if (!pay) return null;
+  const tier = typeof pay.payIdentityStr === 'string' ? pay.payIdentityStr.trim() : '';
+  if (tier) return pay.inTrial ? `${tier} · 试用中` : tier;
+  if (pay.hasPackage) return '已订阅';
+  if (pay.inTrial) return '试用中';
+  return 'Free';
+}
+
 /** Trae 通道页：登录态、账号切换、额度、签到、选集/预算、Raw Chat 诊断 */
 export default function TraePage({ region, onRegion, onChannelChanged }) {
   const { data, loading, error, reload, mutate } = useAsyncData(
@@ -21,6 +57,8 @@ export default function TraePage({ region, onRegion, onChannelChanged }) {
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState(null); // {kind, text}
   const [pendingToggle, setPendingToggle] = useState(null);
+  const [probes, setProbes] = useState({});
+  useEffect(() => { setProbes({}); }, [region]);
 
   const doc = data?.regions?.[region];
   const prefs = doc?.prefs ?? {};
@@ -62,6 +100,30 @@ export default function TraePage({ region, onRegion, onChannelChanged }) {
     }
   }
 
+  async function testModels(ids) {
+    setBusy(true);
+    setNotice(null);
+    try {
+      const out = await api.postTraeControl(region, { action: 'test-models', models: ids });
+      if (out?.state !== 'updated') {
+        setNotice({ kind: 'err', text: `测试失败：${out?.reason ?? out?.state ?? '未知原因'}` });
+        return;
+      }
+      const next = {};
+      for (const row of out.results ?? []) next[row.id] = row;
+      setProbes(next);
+      const bad = (out.results ?? []).filter((row) => row.verdict !== 'available').length;
+      setNotice({
+        kind: bad > 0 ? 'info' : 'ok',
+        text: `已测试 ${out.results?.length ?? 0} 个模型${bad > 0 ? `，${bad} 个不是可用` : ''}`,
+      });
+    } catch (e) {
+      setNotice({ kind: 'err', text: `测试失败：${e.message ?? e}` });
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function checkin() {
     setBusy(true);
     try {
@@ -79,6 +141,8 @@ export default function TraePage({ region, onRegion, onChannelChanged }) {
   }
 
   const signedIn = doc?.status === 'signed-in';
+  const lapsing = expiryNotice(doc?.credits?.expiry);
+  const deviceCheckedElsewhere = doc?.checkin?.didCheckedIn === true && doc?.checkin?.checkedIn !== true;
   const channelEnabled = prefs.enabled !== false;
   // 模型选集语义（源）：空集 = 全部启用。切换时按全集展开，避免"空集关掉一个变成全关"。
   const allIds = (doc?.models ?? []).map((m) => m.id);
@@ -119,6 +183,31 @@ export default function TraePage({ region, onRegion, onChannelChanged }) {
       onChannelChanged?.();
     } catch (e) {
       patchPrefs({ modelSelection: previous });
+      setNotice({ kind: 'err', text: `操作失败：${e.message ?? e}` });
+    } finally {
+      setPendingToggle(null);
+    }
+  }
+
+  /** 上下文只允许切到该模型公布的 Max 窗口。null 表示回到默认档。 */
+  async function chooseContext(id, maxWindow) {
+    const previous = prefs.contextBudgets ?? {};
+    const next = { ...previous };
+    if (typeof maxWindow === 'number') next[id] = maxWindow;
+    else delete next[id];
+    patchPrefs({ contextBudgets: next });
+    setNotice(null);
+    setPendingToggle(`ctx:${id}`);
+    try {
+      const out = await api.postTraeControl(region, { action: 'set-context-budgets', budgets: next });
+      if (out?.state !== 'updated') {
+        patchPrefs({ contextBudgets: previous });
+        setNotice({ kind: 'err', text: `操作失败：${out?.reason ?? out?.state ?? '未知原因'}` });
+        return;
+      }
+      onChannelChanged?.();
+    } catch (e) {
+      patchPrefs({ contextBudgets: previous });
       setNotice({ kind: 'err', text: `操作失败：${e.message ?? e}` });
     } finally {
       setPendingToggle(null);
@@ -196,6 +285,21 @@ export default function TraePage({ region, onRegion, onChannelChanged }) {
       {doc && signedIn && (
         <>
           {notice && <Notice kind={notice.kind}>{notice.text}</Notice>}
+          {doc.appLogin && (
+            <Notice kind="info">
+              Trae 已登录 {doc.appLogin.accountName}，网关绑定的是 {doc.accountName ?? '另一个账号'}。
+              <button
+                type="button"
+                className="btn sm"
+                style={{ marginLeft: 8 }}
+                disabled={busy}
+                onClick={() => control({ action: 'select-account', accountId: doc.appLogin.id }, `已改用 ${doc.appLogin.accountName}`)}
+              >
+                改用 {doc.appLogin.accountName}
+              </button>
+            </Notice>
+          )}
+          {lapsing && <Notice kind={lapsing.kind}>{lapsing.text}</Notice>}
 
           <Section title="额度" actions={doc.accountName && <span className="section-hint">账号 <code className="inline">{doc.accountName}</code>{doc.tokenExpiresAtMs && <> · 令牌到期 {fmtTime(doc.tokenExpiresAtMs)}</>}</span>}>
             {/* 多账号时给出切换（源 accounts.{cn,ai} 选择语义；选择持久化在网关侧） */}
@@ -223,13 +327,19 @@ export default function TraePage({ region, onRegion, onChannelChanged }) {
                   { label: 'Work 通道可用', value: fmtNum(doc.credits?.workAvailable) },
                   { label: '通用通道可用', value: fmtNum(doc.credits?.generalAvailable) },
                 ]}
-                packs={(doc.credits?.accounts ?? []).filter((p) => p.remain > 0).map((p) => ({ name: p.displayDesc, remain: p.remain, size: p.size }))}
+                packs={(doc.credits?.accounts ?? []).filter((p) => p.remain > 0).map((p) => ({
+                  name: p.displayDesc,
+                  remain: p.remain,
+                  size: p.size,
+                  note: p.expiresAtMs ? `到期 ${fmtTime(p.expiresAtMs)}` : undefined,
+                }))}
                 error={doc.creditsError}
                 unavailable={doc.usageUnavailable ? `额度信息不可用（${doc.usageUnavailable}）` : undefined}
               />
             ) : (
               <CreditsPanel
-                unavailable={doc.payStatus ? '国际版订阅状态正常（上游不提供积分明细）' : undefined}
+                metrics={doc.payStatus ? [{ label: '套餐', value: planLabel(doc.payStatus), hero: true }] : []}
+                unavailable={doc.payStatus ? '国际版按套餐计费，上游不提供积分明细' : undefined}
                 error={doc.payStatusError}
               />
             )}
@@ -238,7 +348,7 @@ export default function TraePage({ region, onRegion, onChannelChanged }) {
               <div className="endpoint" style={{ marginTop: 14 }}>
                 <CalendarCheckIcon size={16} style={{ color: 'var(--accent)' }} />
                 <span className="meta">
-                  签到：<strong style={{ color: 'var(--text)' }}>{doc.checkin.checkedIn ? '今日已签' : '今日未签'}</strong>
+                  签到：<strong style={{ color: 'var(--text)' }}>{doc.checkin.checkedIn ? '今日已签' : deviceCheckedElsewhere ? '本设备今日已签，这个账号还没领到' : '今日未签'}</strong>
                   {typeof doc.checkin.credits === 'number' && doc.checkin.credits > 0 && ` · 可领 ${doc.checkin.credits} 积分`}
                   {doc.checkin.enabled === false && ' · 活动未开启'}
                 </span>
@@ -246,10 +356,10 @@ export default function TraePage({ region, onRegion, onChannelChanged }) {
                 <button
                   type="button"
                   className="btn primary sm"
-                  disabled={busy || doc.checkin.checkedIn || doc.checkin.enabled === false}
+                  disabled={busy || doc.checkin.checkedIn || doc.checkin.didCheckedIn || doc.checkin.enabled === false}
                   onClick={checkin}
                 >
-                  {doc.checkin.checkedIn ? '已领取' : '领取签到奖励'}
+                  {doc.checkin.checkedIn ? '已领取' : deviceCheckedElsewhere ? '本设备已用过' : '领取签到奖励'}
                 </button>
               </div>
             )}
@@ -258,12 +368,66 @@ export default function TraePage({ region, onRegion, onChannelChanged }) {
           <Section
             title="模型"
             count={`${(doc.models ?? []).length}`}
-            hint={<span className="section-hint">选集与图片开关只影响对话；ID 始终可复制</span>}
+            hint={<span className="section-hint">有 Max 档的模型可在默认窗口和最大窗口之间选。测试会逐个发一次短请求，消耗少量积分。</span>}
+            actions={(
+              <>
+                <button
+                  type="button"
+                  className="btn sm"
+                  disabled={busy || effectiveEnabled.size === 0}
+                  onClick={() => testModels([...effectiveEnabled])}
+                >
+                  测试已启用
+                </button>
+                <button
+                  type="button"
+                  className="btn sm"
+                  disabled={busy || allIds.length === 0}
+                  onClick={() => testModels(allIds)}
+                >
+                  测试全部
+                </button>
+              </>
+            )}
           >
             <ModelTable
               models={doc.models}
               columns={[
-                { key: 'ctx', label: '上下文', numeric: true, render: (m) => fmtCtx(m.contextWindow) ?? '—' },
+                {
+                  key: 'ctx',
+                  label: '上下文',
+                  render: (m) => {
+                    const dev = m.contextWindow;
+                    const max = m.maxContextWindow;
+                    if (typeof max !== 'number' || max <= (dev ?? 0)) return fmtCtx(dev) ?? '—';
+                    const usingMax = prefs.contextBudgets?.[m.id] === max;
+                    return (
+                      <Select
+                        size="small"
+                        aria-label={`上下文 ${m.id}`}
+                        value={usingMax ? 'max' : 'dev'}
+                        disabled={busy || pendingToggle === `ctx:${m.id}`}
+                        popupMatchSelectWidth={false}
+                        style={{ minWidth: 108 }}
+                        onChange={(value) => chooseContext(m.id, value === 'max' ? max : null)}
+                        options={[
+                          { value: 'dev', label: fmtCtx(dev) ?? '默认' },
+                          { value: 'max', label: `${fmtCtx(max)} Max` },
+                        ]}
+                      />
+                    );
+                  },
+                },
+                {
+                  key: 'probe',
+                  label: '测试',
+                  render: (m) => {
+                    const row = probes[m.id];
+                    if (!row) return '—';
+                    const label = PROBE_LABEL[row.verdict] ?? row.verdict;
+                    return <span title={row.detail || undefined}>{label}</span>;
+                  },
+                },
                 { key: 'rate', label: '倍率', numeric: true, render: (m) => (typeof m.creditMultiplier === 'number' ? `x${m.creditMultiplier}` : '—') },
                 {
                   key: 'img',
@@ -306,7 +470,6 @@ export default function TraePage({ region, onRegion, onChannelChanged }) {
                 onChange={(on) => control({ action: 'set-enabled', enabled: on }, on ? '区域已启用' : '区域已停用')}
               />
             </div>
-            <ContextBudgetEditor budgets={prefs.contextBudgets ?? {}} models={doc.models ?? []} busy={busy} onSave={(b) => control({ action: 'set-context-budgets', budgets: b }, '上下文预算已保存')} />
             {doc.rawChat && (
               <p className="small dim" style={{ margin: 0 }}>
                 Raw Chat 网关（CN）：{doc.rawChat.state ?? '未知'}{doc.rawChat.reason ? ` · ${doc.rawChat.reason}` : ''}
@@ -320,58 +483,5 @@ export default function TraePage({ region, onRegion, onChannelChanged }) {
         </>
       )}
     </ChannelLayout>
-  );
-}
-
-/** 每模型上下文预算（源 contextBudgets 配置；留空 = 跟随上游） */
-function ContextBudgetEditor({ budgets, models, busy, onSave }) {
-  const [draft, setDraft] = useState(null);
-  const value = draft ?? budgets;
-  return (
-    <div className="setting-row" style={{ alignItems: 'flex-start' }}>
-      <div className="grow">
-        <div>上下文预算</div>
-        <div className="desc">按模型覆盖对话时的上下文窗口（token 数），留空跟随上游</div>
-        <div style={{ display: 'grid', gap: 4, marginTop: 8 }}>
-          {models.map((m) => (
-            <label key={m.id} style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 14 }}>
-              <code className="inline" style={{ minWidth: 160 }}>{m.id}</code>
-              <input
-                value={value[m.id] ?? ''}
-                onChange={(e) => {
-                  const next = { ...value };
-                  if (e.target.value === '') delete next[m.id];
-                  else next[m.id] = e.target.value;
-                  setDraft(next);
-                }}
-                placeholder="默认"
-                inputMode="numeric"
-                style={{
-                  width: 110, background: 'var(--panel-2)', border: '1px solid var(--line)',
-                  borderRadius: 6, color: 'var(--text)', padding: '3px 8px', font: '14px var(--mono)',
-                }}
-              />
-            </label>
-          ))}
-        </div>
-        <button
-          type="button"
-          className="btn sm"
-          style={{ marginTop: 8 }}
-          disabled={busy}
-          onClick={() => {
-            const clean = {};
-            for (const [k, v] of Object.entries(value)) {
-              const n = Number(v);
-              if (v !== '' && Number.isFinite(n) && n >= 1) clean[k] = Math.floor(n);
-            }
-            setDraft(null);
-            onSave(clean);
-          }}
-        >
-          保存预算
-        </button>
-      </div>
-    </div>
   );
 }

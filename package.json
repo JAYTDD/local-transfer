@@ -17,7 +17,8 @@
     "build": "npm run build -w @aihub/shared && npm run build -w @aihub/server && npm run build -w @aihub/web",
     "start": "npm run start -w @aihub/server",
     "test": "npm run test -w @aihub/shared && npm run test -w @aihub/server && npm run test -w @aihub/relay && npm run test -w @aihub/web",
-    "sync:relay-deps": "node packages/relay/scripts/sync-deps.mjs"
+    "sync:relay-deps": "node packages/relay/scripts/sync-deps.mjs",
+    "update:relay-plugins": "node packages/relay/scripts/update-plugins.mjs"
   },
   "devDependencies": {
     "concurrently": "^9.2.1",

@@ -23,8 +23,17 @@ test('deriveCatalog 有选集时按选集过滤', () => {
 });
 
 test('deriveCatalog 预算等于 maxContextWindow 时提升 contextWindow', () => {
-  const out = deriveCatalog([{ id: 'a', maxContextWindow: 200000 }], new Set(), { a: 200000 });
+  const out = deriveCatalog([{ id: 'a', contextWindow: 128000, maxContextWindow: 200000 }], new Set(), { a: 200000 });
   assert.equal(out[0].contextWindow, 200000);
+});
+
+test('deriveCatalog 预算不是公布的 Max 时保持默认窗口', () => {
+  const out = deriveCatalog(
+    [{ id: 'a', contextWindow: 128000, maxContextWindow: 1_000_000 }],
+    new Set(),
+    { a: 200000 },
+  );
+  assert.equal(out[0].contextWindow, 128000);
 });
 
 test('attachWireMaxTokens 按 id 把线目录的输出上限补回合并行', () => {

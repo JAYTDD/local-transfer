@@ -36,24 +36,73 @@ function toModelRow(m) {
     id: m.id,
     name: m.name ?? m.id,
     ...(m.contextWindow === undefined ? {} : { contextWindow: m.contextWindow }),
+    ...(typeof m.maxContextWindow === 'number' && m.maxContextWindow > (m.contextWindow ?? 0)
+      ? { maxContextWindow: m.maxContextWindow }
+      : {}),
     ...(m.maxTokens === undefined ? {} : { maxTokens: m.maxTokens }),
     ...(Array.isArray(m.input) ? { input: m.input } : {}),
     ...(typeof m.creditMultiplier === 'number' ? { creditMultiplier: m.creditMultiplier } : {}),
   };
 }
 
+/** 0 和非法时间不能当到期时刻，否则会排成 1970。 */
+function usableExpiry(endTimeMs) {
+  return typeof endTimeMs === 'number' && Number.isFinite(endTimeMs) && endTimeMs > 0;
+}
+
+const NO_EXPIRING_CREDIT = { total: 0, packs: 0 };
+
+function sumExpiring(packs, matches) {
+  let total = 0;
+  let count = 0;
+  let earliestExpiresAtMs;
+  for (const pack of packs) {
+    const expiresAt = pack.expiresAtMs;
+    if (!usableExpiry(expiresAt) || !(pack.remain > 0)) continue;
+    if (!matches(expiresAt)) continue;
+    total += pack.remain;
+    count += 1;
+    if (earliestExpiresAtMs === undefined || expiresAt < earliestExpiresAtMs) earliestExpiresAtMs = expiresAt;
+  }
+  if (count === 0) return NO_EXPIRING_CREDIT;
+  return {
+    total,
+    packs: count,
+    ...(earliestExpiresAtMs === undefined ? {} : { earliestExpiresAtMs }),
+  };
+}
+
+/** 没有任何可用到期时刻时不带 expiry，避免把「没告诉时间」显示成「没有快到期的」。 */
+function summarisePackExpiry(accounts, nowMs) {
+  if (!accounts.some((pack) => usableExpiry(pack.expiresAtMs))) return {};
+  const day = 86_400_000;
+  return {
+    expiry: {
+      within24h: sumExpiring(accounts, (expiresAt) => expiresAt > nowMs && expiresAt - nowMs <= day),
+      within3d: sumExpiring(accounts, (expiresAt) => expiresAt > nowMs && expiresAt - nowMs <= 3 * day),
+      within7d: sumExpiring(accounts, (expiresAt) => expiresAt > nowMs && expiresAt - nowMs <= 7 * day),
+      expired: sumExpiring(accounts, (expiresAt) => expiresAt <= nowMs),
+    },
+  };
+}
+
 /**
  * 额度快照 → 面板字段。
  *
- * 形状照抄源实现（trae:3823 `toCredits`）：snapshot 是嵌套的，
- * summary 给总量，packs 按 availableEndpoint 分成 work(1) 与 general(0) 两块可用额度。
- * 不做白名单裁剪——这里映射出的字段本身已是受控集合。
+ * 形状照抄插件 toCredits：summary 给总量，packs 按 availableEndpoint 分成
+ * work(1) 与 general(0)。有余额的包带上到期时刻，并按 24 小时 / 3 天 / 7 天 / 已过期分桶。
  */
-export function toCredits(snapshot) {
+export function toCredits(snapshot, nowMs = Date.now()) {
   const round = (value) => Math.round(value * 1e4) / 1e4;
   const totalAmount = snapshot?.summary?.totalAmount ?? 0;
   const consumedAmount = snapshot?.summary?.consumedAmount ?? 0;
   const packs = Array.isArray(snapshot?.packs) ? snapshot.packs : [];
+  const accounts = packs.map((pack) => ({
+    displayDesc: pack.displayDesc,
+    remain: round(Math.max(0, (pack.creditsLimit ?? 0) - (pack.consumedCredits ?? 0))),
+    size: pack.creditsLimit ?? 0,
+    ...(usableExpiry(pack.endTimeMs) ? { expiresAtMs: pack.endTimeMs } : {}),
+  }));
   const remaining = (endpoint) =>
     packs
       .filter((pack) => pack.availableEndpoint === endpoint)
@@ -64,12 +113,28 @@ export function toCredits(snapshot) {
     available: totalAmount - consumedAmount,
     workAvailable: remaining(1),
     generalAvailable: remaining(0),
-    accounts: packs.map((pack) => ({
-      displayDesc: pack.displayDesc,
-      remain: round(Math.max(0, (pack.creditsLimit ?? 0) - (pack.consumedCredits ?? 0))),
-      size: pack.creditsLimit ?? 0,
-    })),
+    accounts,
+    ...summarisePackExpiry(accounts, nowMs),
   };
+}
+
+/** 仅在 Trae 客户端当前登录和网关绑定账号不一致时带上，健康文档不加这个字段。 */
+async function appLoginField(provider, selected) {
+  if (typeof provider?.store?.liveLogin !== 'function') return {};
+  try {
+    const live = await provider.store.liveLogin();
+    if (!live || typeof live.id !== 'string' || live.id === '' || live.id === selected?.id) return {};
+    return {
+      appLogin: {
+        id: live.id,
+        accountName: live.accountName ?? live.id,
+        ...(live.edition === undefined ? {} : { edition: live.edition }),
+        ...(live.region === undefined ? {} : { region: live.region }),
+      },
+    };
+  } catch {
+    return {};
+  }
 }
 
 /** 签到状态 → 面板字段（形状照抄源实现 trae:3842 `toCheckin`） */
@@ -220,8 +285,9 @@ export function createTraeStatus({ providers }) {
             }
           : {}),
         ...usageFields,
+        ...(await appLoginField(liveProvider, selected)),
         // 面板管理需要全部模型（选集只影响对话），display 语义 = 只剔死模型
-        models: liveProvider.displayModels?.() ?? models,
+        models: (liveProvider.displayModels?.() ?? liveProvider.models?.() ?? entry.models ?? []).map(toModelRow),
         enabledModelIds: models.map((m) => m.id),
         // 通道偏好与诊断（源卡片的设置面/诊断面）
         prefs: {
@@ -266,6 +332,12 @@ export function createTraeStatus({ providers }) {
           return provider.setContextBudgets(action.budgets);
         case 'logout':
           return provider.logout();
+        case 'test-models':
+          if (!Array.isArray(action.models)) return { state: 'failed', reason: 'test-models requires models' };
+          if (typeof provider.probeModels !== 'function') {
+            return { state: 'failed', reason: 'action not wired yet: test-models' };
+          }
+          return provider.probeModels(action.models);
         default:
           return { state: 'failed', reason: `unknown action: ${String(action?.action)}` };
       }

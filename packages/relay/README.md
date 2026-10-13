@@ -58,8 +58,14 @@ AiHub 的内置模型通道模块。把三个 DSH 订阅接入插件——`dsh-c
 审查。`src/providers/*.mjs` 里的 `import 'dsh-connect-trae'` 是裸包名解析，所以
 运行时需要 `packages/relay/node_modules/`——它由脚本从 `shims/` 复制而来：
 
+三个订阅插件用一条命令换成 npm 上的版本。它只替换对应插件目录，不改手写的
+DSH 桩；入口引用了还没有的桩时会停下来并列出模块名。换完后看 `git diff`，再跑
+`npm test -w @aihub/relay`。开发进程要重启才会读到新包。
+
 ```powershell
-npm run sync:relay-deps          # 在仓库根执行；改了桩之后必须重跑
+npm run update:relay-plugins
+npm run update:relay-plugins -- dsh-connect-trae@3.4.2
+npm run sync:relay-deps          # 只重建 node_modules；改了桩之后用这个
 ```
 
 ## 状态目录

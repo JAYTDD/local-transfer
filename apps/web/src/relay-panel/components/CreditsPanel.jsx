@@ -4,7 +4,7 @@ import { Disclosure, Metric, fmtNum } from './primitives.jsx';
 /**
  * 额度展示：主指标 + 可选明细。
  * metrics: [{label, value, unit?, hero?, hint?}]（value 为 null 的项自动省略）
- * packs:   [{name, remain, size}] 有余额的额度/权益包，收进折叠明细
+ * packs:   [{name, remain, size, note?}] 有余额的额度/权益包，收进折叠明细
  */
 export default function CreditsPanel({ metrics = [], packs = [], error, unavailable }) {
   const visible = metrics.filter((m) => m.value !== null && m.value !== undefined);
@@ -27,7 +27,7 @@ export default function CreditsPanel({ metrics = [], packs = [], error, unavaila
             {packs.map((p, i) => (
               <li key={i}>
                 {p.name || '（未命名）'}
-                <span className="reason"> — 剩余 {fmtNum(p.remain)} / {fmtNum(p.size)}</span>
+                <span className="reason"> — 剩余 {fmtNum(p.remain)} / {fmtNum(p.size)}{p.note ? ` · ${p.note}` : ''}</span>
               </li>
             ))}
           </ul>

@@ -2,14 +2,12 @@
  * Qoder 供应商：从 dsh-qoder-connect 提取协议层，装配成独立的
  * OpenAI 兼容 loopback shim。
  *
- * ⚠️ 两个与另外两个插件不同的地方，改之前先看这里：
+ * ⚠️ 三处和另外两个插件不同的地方，改之前先看这里：
  *
- * 1. **transport 与 getMachineId 没从包根导出**。包的 `exports` 只暴露
- *    `.` / `./client` 等，`import 'dsh-qoder-connect/lib/variants-CFI6-cGn.js'`
- *    会报 ERR_PACKAGE_PATH_NOT_EXPORTED。这里按**绝对路径**导入同一个文件
- *    （本地 vendor 的副本，路径自己算），所以能拿到 `createQoderTransport`。
- *    这是本项目能接 Qoder 的关键——PROJECT.md 早期版本说"未导出所以接不了"，
- *    那个结论是错的。
+ * 1. **transport、getMachineId、validateApiKey 没从包根导出**。包的 `exports`
+ *    只暴露 `.` / `./client` 等，按包名导入内部文件会报 ERR_PACKAGE_PATH_NOT_EXPORTED。
+ *    构建产物的文件名带哈希，所以在 lib/ 里找同时导出 `b`、`x`、`y` 的那个文件，
+ *    再按绝对路径导入。这是本项目能接 Qoder 的关键。
  *
  * 2. **attachments 是必填依赖，哪怕只发纯文本**。transport 的
  *    `enforceImageLimits()` 会无条件读 `attachments.imageLimits`，缺了就在
@@ -21,6 +19,7 @@
  * 3. **shim.baseUrl 与 shim.token 是函数**，要 `shim.baseUrl()` 调用；
  *    Trae/WorkBuddy 的 shim 是字符串。
  */
+import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import * as qoder from 'dsh-qoder-connect';
@@ -35,26 +34,45 @@ const logger = {
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 
+const QODER_CHUNK_SKIP = new Set(['client.js', 'bin.js']);
+
+/** 构建哈希会变。在 lib/ 里找同时导出 transport(b)、getMachineId(x)、validateApiKey(y) 的文件。 */
+export async function findQoderChunk(libDir) {
+  const names = fs.readdirSync(libDir).filter((name) => name.endsWith('.js') && !QODER_CHUNK_SKIP.has(name));
+  const hits = [];
+  for (const name of names) {
+    const file = path.join(libDir, name);
+    try {
+      const mod = await import(pathToFileURL(file).href);
+      if (typeof mod.b === 'function' && typeof mod.x === 'function' && typeof mod.y === 'function') {
+        hits.push({ file, mod });
+      }
+    } catch {
+      // 浏览器包或当前进程求值不了的文件跳过。
+    }
+  }
+  if (hits.length !== 1) {
+    throw new Error(hits.length === 0
+      ? `在 ${libDir} 里找不到同时导出 b、x、y 的模块`
+      : `在 ${libDir} 里有多个模块同时导出 b、x、y：${hits.map((hit) => hit.file).join(', ')}`);
+  }
+  return hits[0];
+}
+
 /**
  * 从包内 lib 目录按绝对路径取未导出的内部符号。
  * 包名可能出现在本项目的 node_modules，也可能只在 shims/ 下，两个都试。
  */
 async function loadInternals() {
-  const candidates = [
-    path.resolve(HERE, '..', '..', 'node_modules', 'dsh-qoder-connect', 'lib', 'variants-CFI6-cGn.js'),
-    path.resolve(HERE, '..', '..', 'shims', 'node_modules', 'dsh-qoder-connect', 'lib', 'variants-CFI6-cGn.js'),
+  const dirs = [
+    path.resolve(HERE, '..', '..', 'node_modules', 'dsh-qoder-connect', 'lib'),
+    path.resolve(HERE, '..', '..', 'shims', 'node_modules', 'dsh-qoder-connect', 'lib'),
   ];
   let lastErr;
-  for (const file of candidates) {
+  for (const dir of dirs) {
+    if (!fs.existsSync(dir)) continue;
     try {
-      const mod = await import(pathToFileURL(file).href);
-      if (typeof mod.b !== 'function' || typeof mod.x !== 'function') {
-        throw new Error(`内部导出不符合预期（b=${typeof mod.b}, x=${typeof mod.x}）`);
-      }
-      // validateApiKey（别名 y）也未从包根导出，PAT 手动录入要用它做上游校验
-      if (typeof mod.y !== 'function') {
-        throw new Error(`内部导出缺少 validateApiKey（y=${typeof mod.y}）`);
-      }
+      const { file, mod } = await findQoderChunk(dir);
       return { createQoderTransport: mod.b, getMachineId: mod.x, validateApiKey: mod.y, file };
     } catch (e) {
       lastErr = e;

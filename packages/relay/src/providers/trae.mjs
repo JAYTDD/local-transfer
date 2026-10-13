@@ -320,6 +320,16 @@ export function createTraeProvider(region) {
       await store.logout();
       return { state: 'updated' };
     },
+    /** 逐个发一次很短的真实请求。会消耗少量积分，只由面板按钮触发。 */
+    async probeModels(ids) {
+      const list = [...new Set((Array.isArray(ids) ? ids : []).filter((id) => typeof id === 'string' && id !== ''))].slice(0, 40);
+      if (list.length === 0) return { state: 'failed', reason: 'test-models requires models' };
+      const results = await trae.probeModelsSequentially(
+        (body, signal) => delegating.chatStream(body, signal),
+        list,
+      );
+      return { state: 'updated', results };
+    },
     async close() {
       await this.shim?.close();
     },

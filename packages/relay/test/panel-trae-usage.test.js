@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createTraeStatus } from '../src/panel/trae-status.mjs';
+import { createTraeStatus, toCredits } from '../src/panel/trae-status.mjs';
 
 function fakeProvider({ usage }) {
   return {
@@ -42,6 +42,129 @@ test('CN 区域把 snapshot / checkinStatus 映射进文档', async () => {
   assert.equal(doc.credits.workAvailable, 45, 'endpoint 1 的剩余');
   assert.equal(doc.credits.accounts.length, 2);
   assert.equal(doc.checkin.credits, 5);
+});
+
+test('有余额的积分包带上到期时刻，快到期和已过期分开计', async () => {
+  const now = Date.now();
+  const provider = fakeProvider({
+    usage: {
+      snapshot: async () => ({
+        summary: { totalAmount: 30, consumedAmount: 0, consumptionRatio: 0 },
+        packs: [
+          { displayDesc: '快到期', creditsLimit: 10, consumedCredits: 0, availableEndpoint: 0, endTimeMs: now + 3_600_000 },
+          { displayDesc: '已过期', creditsLimit: 8, consumedCredits: 0, availableEndpoint: 0, endTimeMs: now - 1_000 },
+          { displayDesc: '没日期', creditsLimit: 4, consumedCredits: 0, availableEndpoint: 0, endTimeMs: 0 },
+          { displayDesc: '用完了', creditsLimit: 6, consumedCredits: 6, availableEndpoint: 0, endTimeMs: now + 1_000 },
+        ],
+      }),
+      checkinStatus: async () => ({ checkedIn: false, credits: 0, enabled: true, didCheckedIn: false }),
+    },
+  });
+  const doc = await createTraeStatus(cnDeps(provider)).document('cn');
+  assert.equal(doc.credits.accounts[0].expiresAtMs, now + 3_600_000);
+  assert.equal(doc.credits.accounts[2].expiresAtMs, undefined);
+  assert.equal(doc.credits.expiry.within24h.packs, 1);
+  assert.equal(doc.credits.expiry.within24h.total, 10);
+  assert.equal(doc.credits.expiry.expired.packs, 1);
+  assert.equal(doc.credits.expiry.expired.total, 8);
+});
+
+test('到期分桶互不混，没有日期则不带 expiry', () => {
+  const now = 1_700_000_000_000;
+  const day = 86_400_000;
+  const dated = toCredits({
+    summary: { totalAmount: 1, consumedAmount: 0 },
+    packs: [
+      { displayDesc: 'soon', creditsLimit: 3, consumedCredits: 0, endTimeMs: now + 3_600_000 },
+      { displayDesc: 'week', creditsLimit: 2, consumedCredits: 0, endTimeMs: now + 5 * day },
+    ],
+  }, now);
+  assert.equal(dated.expiry.within24h.packs, 1);
+  assert.equal(dated.expiry.within3d.packs, 1);
+  assert.equal(dated.expiry.within7d.packs, 2);
+  assert.equal(dated.expiry.expired.packs, 0);
+  const undated = toCredits({
+    summary: { totalAmount: 1, consumedAmount: 0 },
+    packs: [{ displayDesc: 'x', creditsLimit: 1, consumedCredits: 0 }],
+  }, now);
+  assert.equal(undated.expiry, undefined);
+});
+
+test('liveLogin 失败不拖垮文档', async () => {
+  const provider = fakeProvider({
+    usage: {
+      snapshot: async () => ({ summary: { totalAmount: 1, consumedAmount: 0 }, packs: [] }),
+      checkinStatus: async () => ({ checkedIn: false, credits: 0, enabled: true, didCheckedIn: false }),
+    },
+  });
+  provider.store.liveLogin = async () => { throw new Error('scan failed'); };
+  const doc = await createTraeStatus(cnDeps(provider)).document('cn');
+  assert.equal(doc.status, 'signed-in');
+  assert.equal(doc.appLogin, undefined);
+});
+
+test('set-context-budgets 原样交给 provider', async () => {
+  const provider = fakeProvider({ usage: undefined });
+  let saved;
+  provider.setContextBudgets = async (budgets) => {
+    saved = budgets;
+    return { state: 'updated' };
+  };
+  const out = await createTraeStatus(cnDeps(provider)).control('cn', {
+    action: 'set-context-budgets',
+    budgets: { wide: 1_000_000 },
+  });
+  assert.equal(out.state, 'updated');
+  assert.deepEqual(saved, { wide: 1_000_000 });
+});
+
+test('没有 probeModels 时 test-models 失败', async () => {
+  const out = await createTraeStatus(cnDeps(fakeProvider({ usage: undefined }))).control('cn', {
+    action: 'test-models',
+    models: ['glm-5.3'],
+  });
+  assert.equal(out.state, 'failed');
+  assert.match(out.reason, /not wired/);
+});
+
+test('模型行只在 Max 窗口更大时带上可选项', async () => {
+  const provider = fakeProvider({
+    usage: {
+      snapshot: async () => ({ summary: { totalAmount: 1, consumedAmount: 0 }, packs: [] }),
+      checkinStatus: async () => ({ checkedIn: false, credits: 0, enabled: true, didCheckedIn: false }),
+    },
+  });
+  provider.displayModels = () => [
+    { id: 'wide', name: 'Wide', contextWindow: 200000, maxContextWindow: 1000000 },
+    { id: 'same', name: 'Same', contextWindow: 128000, maxContextWindow: 128000 },
+  ];
+  const doc = await createTraeStatus(cnDeps(provider)).document('cn');
+  assert.equal(doc.models[0].maxContextWindow, 1000000);
+  assert.equal(doc.models[1].maxContextWindow, undefined);
+});
+
+test('客户端登录和绑定账号不一致时给出可切换的提示', async () => {
+  const provider = fakeProvider({
+    usage: {
+      snapshot: async () => ({ summary: { totalAmount: 1, consumedAmount: 0 }, packs: [] }),
+      checkinStatus: async () => ({ checkedIn: false, credits: 0, enabled: true, didCheckedIn: false }),
+    },
+  });
+  provider.store.liveLogin = async () => ({ id: 'a2', accountName: 'other', edition: 'cn', region: 'cn' });
+  const mismatch = await createTraeStatus(cnDeps(provider)).document('cn');
+  assert.equal(mismatch.appLogin.id, 'a2');
+  assert.equal(mismatch.appLogin.accountName, 'other');
+
+  provider.store.liveLogin = async () => ({ id: 'a1', accountName: 'tester' });
+  const same = await createTraeStatus(cnDeps(provider)).document('cn');
+  assert.equal(same.appLogin, undefined);
+});
+
+test('test-models 交给 provider.probeModels', async () => {
+  const provider = fakeProvider({ usage: undefined });
+  provider.probeModels = async (ids) => ({ state: 'updated', results: ids.map((id) => ({ id, verdict: 'available', detail: '' })) });
+  const out = await createTraeStatus(cnDeps(provider)).control('cn', { action: 'test-models', models: ['glm-5.3'] });
+  assert.equal(out.results[0].verdict, 'available');
 });
 
 test('额度快照缺 summary/packs 时不崩', async () => {
