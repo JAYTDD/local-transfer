@@ -17,6 +17,8 @@ interface SettingsRecord {
   streamIdleTimeoutMs: number;
   relayEnabled: boolean;
   relayChannels: RelayChannelToggle;
+  /** 0 表示不删除旧日志 */
+  logRetentionDays: number;
 }
 
 const DEFAULT_RELAY_CHANNELS: RelayChannelToggle = { trae: true, workbuddy: true, qoder: true };
@@ -60,6 +62,8 @@ interface ChannelRow {
   position: number;
   created_at: number;
   updated_at: number;
+  model_map?: string | null;
+  extra_api_keys?: string | null;
 }
 
 export interface DatabaseHandle {
@@ -107,6 +111,54 @@ function migrateChannelsProtocolCheck(db: DatabaseSync): void {
   }
 }
 
+function parseJsonObject(value: string | null | undefined): Record<string, string> {
+  if (!value) return {};
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return {};
+    const out: Record<string, string> = {};
+    for (const [key, item] of Object.entries(parsed)) {
+      if (typeof item === 'string' && item !== '') out[key] = item;
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
+function parseJsonStringList(value: string | null | undefined): string[] {
+  if (!value) return [];
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    return Array.isArray(parsed) ? parsed.filter((item): item is string => typeof item === 'string' && item !== '') : [];
+  } catch {
+    return [];
+  }
+}
+
+function migrateChannelRouting(db: DatabaseSync): void {
+  const columns = new Set(
+    (db.prepare('PRAGMA table_info(channels)').all() as unknown as Array<{ name: string }>).map((column) => column.name),
+  );
+  if (!columns.has('model_map')) db.exec("ALTER TABLE channels ADD COLUMN model_map TEXT NOT NULL DEFAULT '{}'");
+  if (!columns.has('extra_api_keys')) db.exec("ALTER TABLE channels ADD COLUMN extra_api_keys TEXT NOT NULL DEFAULT '[]'");
+}
+
+function migrateRequestLogUsage(db: DatabaseSync): void {
+  const columns = new Set(
+    (db.prepare('PRAGMA table_info(request_logs)').all() as unknown as Array<{ name: string }>).map((column) => column.name),
+  );
+  const add = (name: string, type: string) => {
+    if (!columns.has(name)) db.exec(`ALTER TABLE request_logs ADD COLUMN ${name} ${type}`);
+  };
+  add('model_name', 'TEXT');
+  add('prompt_tokens', 'INTEGER');
+  add('completion_tokens', 'INTEGER');
+  add('total_tokens', 'INTEGER');
+  add('cached_tokens', 'INTEGER');
+  add('credit_rate', 'TEXT');
+}
+
 function migrateChannelsAddPosition(db: DatabaseSync): void {
   const columns = db.prepare('PRAGMA table_info(channels)').all() as unknown as Array<{ name: string }>;
   if (columns.some((column) => column.name === 'position')) return;
@@ -141,6 +193,8 @@ function rowToChannel(row: ChannelRow): ChannelRecord {
     defaultMaxTokens: row.default_max_tokens,
     enabled: Boolean(row.enabled),
     models: [],
+    modelMap: parseJsonObject(row.model_map),
+    extraApiKeys: parseJsonStringList(row.extra_api_keys),
     position: row.position,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
@@ -172,6 +226,8 @@ export function createDatabase(databasePath: string): DatabaseHandle {
       default_max_tokens INTEGER NOT NULL,
       enabled INTEGER NOT NULL DEFAULT 1,
       position INTEGER NOT NULL DEFAULT 0,
+      model_map TEXT NOT NULL DEFAULT '{}',
+      extra_api_keys TEXT NOT NULL DEFAULT '[]',
       created_at INTEGER NOT NULL,
       updated_at INTEGER NOT NULL
     );
@@ -188,7 +244,13 @@ export function createDatabase(databasePath: string): DatabaseHandle {
       status TEXT NOT NULL,
       http_status INTEGER,
       duration_ms INTEGER NOT NULL,
-      error_summary TEXT
+      error_summary TEXT,
+      model_name TEXT,
+      prompt_tokens INTEGER,
+      completion_tokens INTEGER,
+      total_tokens INTEGER,
+      cached_tokens INTEGER,
+      credit_rate TEXT
     );
 
     CREATE INDEX IF NOT EXISTS idx_request_logs_created_at ON request_logs(created_at DESC);
@@ -197,6 +259,8 @@ export function createDatabase(databasePath: string): DatabaseHandle {
     CREATE INDEX IF NOT EXISTS idx_request_logs_status ON request_logs(status);
   `);
   migrateChannelsAddPosition(db);
+  migrateChannelRouting(db);
+  migrateRequestLogUsage(db);
   db.exec(`
     DROP TABLE IF EXISTS model_channels;
     DROP TABLE IF EXISTS virtual_models;
@@ -217,6 +281,7 @@ export function createDatabase(databasePath: string): DatabaseHandle {
     ['streamIdleTimeoutMs', '60000'],
     ['relayEnabled', 'true'],
     ['relayChannels', JSON.stringify(DEFAULT_RELAY_CHANNELS)],
+    ['logRetentionDays', '0'],
   ];
   const insertSetting = db.prepare('INSERT OR IGNORE INTO settings(key, value) VALUES (?, ?)');
   for (const [key, value] of defaults) {
@@ -244,6 +309,7 @@ export class Repository {
       // 缺键（老数据库升级上来）时默认启用，与 relayChannels 的回落一致
       relayEnabled: map.get('relayEnabled') !== 'false',
       relayChannels: parseRelayChannels(map.get('relayChannels')),
+      logRetentionDays: Number.parseInt(map.get('logRetentionDays') ?? '0', 10) || 0,
     };
   }
 
@@ -345,6 +411,8 @@ export class Repository {
     defaultMaxTokens: number;
     enabled: boolean;
     models?: string[];
+    modelMap?: Record<string, string>;
+    extraApiKeys?: string[];
   }): ChannelRecord {
     const ts = nowSeconds();
     const id = crypto.randomUUID();
@@ -354,8 +422,8 @@ export class Repository {
     this.db.exec('BEGIN');
     try {
       this.db.prepare(`
-        INSERT INTO channels(id, name, protocol, base_url, api_key, default_max_tokens, enabled, position, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO channels(id, name, protocol, base_url, api_key, default_max_tokens, enabled, position, model_map, extra_api_keys, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         id,
         input.name,
@@ -365,6 +433,8 @@ export class Repository {
         input.defaultMaxTokens,
         input.enabled ? 1 : 0,
         next.position,
+        JSON.stringify(input.modelMap ?? {}),
+        JSON.stringify(input.extraApiKeys ?? []),
         ts,
         ts,
       );
@@ -388,6 +458,8 @@ export class Repository {
       defaultMaxTokens: source.defaultMaxTokens,
       enabled: source.enabled,
       models: source.models,
+      modelMap: source.modelMap,
+      extraApiKeys: source.extraApiKeys,
     });
   }
 
@@ -402,7 +474,7 @@ export class Repository {
     try {
       this.db.prepare(`
         UPDATE channels
-        SET name = ?, protocol = ?, base_url = ?, api_key = ?, default_max_tokens = ?, enabled = ?, updated_at = ?
+        SET name = ?, protocol = ?, base_url = ?, api_key = ?, default_max_tokens = ?, enabled = ?, model_map = ?, extra_api_keys = ?, updated_at = ?
         WHERE id = ?
       `).run(
         next.name,
@@ -411,6 +483,8 @@ export class Repository {
         next.apiKey,
         next.defaultMaxTokens,
         next.enabled ? 1 : 0,
+        JSON.stringify(next.modelMap ?? {}),
+        JSON.stringify(next.extraApiKeys ?? []),
         next.updatedAt,
         id,
       );
@@ -450,8 +524,9 @@ export class Repository {
     this.db.prepare(`
       INSERT INTO request_logs(
         created_at, virtual_model, channel_id, channel_name, protocol, upstream_model,
-        stream, status, http_status, duration_ms, error_summary
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        stream, status, http_status, duration_ms, error_summary,
+        model_name, prompt_tokens, completion_tokens, total_tokens, cached_tokens, credit_rate
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       input.createdAt,
       input.virtualModel,
@@ -464,6 +539,12 @@ export class Repository {
       input.httpStatus,
       input.durationMs,
       input.errorSummary,
+      input.modelName ?? null,
+      input.promptTokens ?? null,
+      input.completionTokens ?? null,
+      input.totalTokens ?? null,
+      input.cachedTokens ?? null,
+      input.creditRate ?? null,
     );
   }
 
@@ -494,11 +575,17 @@ export class Repository {
       where.push('created_at <= ?');
       params.push(filters.to);
     }
+    if (filters.protocol) {
+      where.push('protocol = ?');
+      params.push(filters.protocol);
+    }
     const sql = `
       SELECT
         id, created_at AS createdAt, virtual_model AS virtualModel, channel_id AS channelId,
         channel_name AS channelName, protocol, upstream_model AS upstreamModel, stream,
-        status, http_status AS httpStatus, duration_ms AS durationMs, error_summary AS errorSummary
+        status, http_status AS httpStatus, duration_ms AS durationMs, error_summary AS errorSummary,
+        model_name AS modelName, prompt_tokens AS promptTokens, completion_tokens AS completionTokens,
+        total_tokens AS totalTokens, cached_tokens AS cachedTokens, credit_rate AS creditRate
       FROM request_logs
       ${where.length ? `WHERE ${where.join(' AND ')}` : ''}
       ORDER BY created_at DESC, id DESC
@@ -509,6 +596,50 @@ export class Repository {
     return rows.map((row) => ({
       ...row,
       stream: Boolean(row.stream),
+    }));
+  }
+
+  pruneRequestLogs(retentionDays: number): number {
+    if (!Number.isFinite(retentionDays) || retentionDays <= 0) return 0;
+    const cutoff = nowSeconds() - Math.floor(retentionDays) * 86_400;
+    const result = this.db.prepare('DELETE FROM request_logs WHERE created_at < ?').run(cutoff);
+    return Number(result.changes);
+  }
+
+  summarizeRelayUsage(filters: Pick<LogFilters, 'channelId' | 'from' | 'to'>): unknown[] {
+    const where = ["protocol = 'relay'"];
+    const params: Array<string | number> = [];
+    if (filters.channelId) {
+      where.push('channel_id = ?');
+      params.push(filters.channelId);
+    }
+    if (filters.from !== undefined) {
+      where.push('created_at >= ?');
+      params.push(filters.from);
+    }
+    if (filters.to !== undefined) {
+      where.push('created_at <= ?');
+      params.push(filters.to);
+    }
+    const rows = this.db.prepare(`
+      SELECT
+        channel_id AS channelId,
+        MAX(channel_name) AS channelName,
+        virtual_model AS model,
+        MAX(model_name) AS modelName,
+        COUNT(*) AS requests,
+        SUM(prompt_tokens) AS promptTokens,
+        SUM(completion_tokens) AS completionTokens
+      FROM request_logs
+      WHERE ${where.join(' AND ')}
+      GROUP BY channel_id, virtual_model
+      ORDER BY requests DESC, virtual_model ASC
+    `).all(...params) as unknown as Array<Record<string, unknown>>;
+    return rows.map((row) => ({
+      ...row,
+      requests: Number(row.requests),
+      promptTokens: row.promptTokens === null ? null : Number(row.promptTokens),
+      completionTokens: row.completionTokens === null ? null : Number(row.completionTokens),
     }));
   }
 }

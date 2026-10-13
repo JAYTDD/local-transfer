@@ -13,7 +13,12 @@
  */
 import type { IncomingMessage, ServerResponse } from 'node:http';
 
-import type { RelayChannelToggle, RelayPrefixStatusDto, RelaySettingsDto } from '@aihub/shared';
+import type {
+  ModelCapabilitiesDto,
+  RelayChannelToggle,
+  RelayPrefixStatusDto,
+  RelaySettingsDto,
+} from '@aihub/shared';
 
 import type { LogRecordInput } from './types.js';
 
@@ -48,6 +53,9 @@ export interface RelayGateway {
   start(): Promise<void>;
   stop(): Promise<void>;
   listModels(): RelayModel[];
+  modelCapabilities(options?: { force?: boolean }): Promise<ModelCapabilitiesDto>;
+  /** 当前目录里的显示名和倍率，键是 `前缀/模型ID` */
+  usageCatalog(): Record<string, { modelName?: string; creditRate?: string }>;
   handleChat(body: unknown, response: ServerResponse): Promise<void>;
   panelApi: RelayPanelApi;
   prefixes: string[];
@@ -107,6 +115,66 @@ export interface RelayLogEntry {
   httpStatus?: number;
   durationMs?: number;
   error?: string;
+  modelName?: string;
+  promptTokens?: number;
+  completionTokens?: number;
+  totalTokens?: number;
+  cachedTokens?: number;
+  creditRate?: string;
+}
+
+function intOrNull(value: number | undefined): number | null {
+  return typeof value === 'number' && Number.isFinite(value) ? Math.floor(value) : null;
+}
+
+/** 目录倍率 `x0.15` / `0.15` → 0.15。解析不了就返回 null。 */
+export function parseCreditRate(rate: string | null | undefined): number | null {
+  if (!rate) return null;
+  const match = /^x?([0-9]+(?:\.[0-9]+)?)$/i.exec(rate.trim());
+  if (!match?.[1]) return null;
+  const value = Number(match[1]);
+  return Number.isFinite(value) ? value : null;
+}
+
+/**
+ * 积分消耗。Trae 的规则是每 1000 个输入加输出 token 按模型倍率扣分：
+ * 积分 = (prompt + completion) × 倍率 / 1000。
+ * WorkBuddy、Qoder 目录上的 xN 是同一种消耗速度，沿用同一公式。
+ * 缓存 token 已包含在输入 token 里，不再另加。
+ */
+export function creditCost(input: {
+  promptTokens: number | null;
+  completionTokens: number | null;
+  totalTokens?: number | null;
+  creditRate: string | null;
+}): number | null {
+  const rate = parseCreditRate(input.creditRate);
+  if (rate === null) return null;
+  let tokens: number | null = null;
+  if (input.promptTokens !== null || input.completionTokens !== null) {
+    tokens = (input.promptTokens ?? 0) + (input.completionTokens ?? 0);
+  } else if (input.totalTokens != null) {
+    tokens = input.totalTokens;
+  }
+  if (tokens === null) return null;
+  return tokens * rate / 1000;
+}
+
+/** 日志里没记下的显示名和倍率，用当前目录补上。已有的记录不覆盖。 */
+export function applyUsageCatalog<T extends { model?: string; virtualModel?: string; modelName?: string | null; creditRate?: string | null }>(
+  rows: T[],
+  catalog: Record<string, { modelName?: string; creditRate?: string }>,
+): T[] {
+  return rows.map((row) => {
+    const key = row.virtualModel ?? row.model;
+    const snap = key ? catalog[key] : undefined;
+    if (!snap) return row;
+    return {
+      ...row,
+      modelName: row.modelName || snap.modelName || null,
+      creditRate: row.creditRate || snap.creditRate || null,
+    };
+  });
 }
 
 /** relay 日志 → AiHub request_logs 记录 */
@@ -130,6 +198,12 @@ export function mapRelayLog(entry: RelayLogEntry): LogRecordInput {
     httpStatus: entry.httpStatus ?? (unknownModel ? 404 : null),
     durationMs: entry.durationMs ?? 0,
     errorSummary: entry.error ?? (unknownModel ? `Unknown model: ${entry.model ?? ''}` : null),
+    modelName: entry.modelName || null,
+    promptTokens: intOrNull(entry.promptTokens),
+    completionTokens: intOrNull(entry.completionTokens),
+    totalTokens: intOrNull(entry.totalTokens),
+    cachedTokens: intOrNull(entry.cachedTokens),
+    creditRate: entry.creditRate || null,
   };
 }
 

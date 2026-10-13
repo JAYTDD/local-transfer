@@ -24,6 +24,7 @@ const app = await buildApp({
 // 所以放在 listen 之前——端口一就绪，relay 的通道就是可用的（与原项目语义一致）。
 // 装配失败只会在日志里告警，不会拦住 AiHub 本体启动。
 const settings = repository.getSettings();
+repository.pruneRequestLogs(settings.logRetentionDays);
 await relay.reconfigure({ enabled: settings.relayEnabled, channels: settings.relayChannels });
 
 await app.listen({ host: config.host, port: config.port });

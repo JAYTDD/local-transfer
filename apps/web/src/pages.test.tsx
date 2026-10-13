@@ -24,6 +24,8 @@ const channel = {
   defaultMaxTokens: 4096,
   enabled: true,
   models: ['m1', 'm2'],
+  modelMap: {},
+  extraKeyCount: 0,
   position: 0,
   createdAt: 1,
   updatedAt: 1,
@@ -344,6 +346,9 @@ describe('admin pages', () => {
           gatewayToken: 'gateway-token',
           connectTimeoutMs: 10000,
           streamIdleTimeoutMs: 60000,
+          logRetentionDays: 0,
+          launchAtLogin: false,
+          launchAtLoginSupported: true,
         };
       }
       return [channel];

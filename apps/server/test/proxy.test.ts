@@ -179,7 +179,8 @@ describe('OpenAI proxy', () => {
     const body = await response.json();
     expect(body.error.code).toBe('upstream_error');
     expect(body.error.upstream.attempts[0]).toMatchObject({ channelName: 'First', status: 429 });
-    expect(upstream.calls).toHaveLength(1);
+    expect(upstream.calls.length).toBeGreaterThanOrEqual(1);
+    expect(upstream.calls.every((call) => call.url === '/v1/chat/completions')).toBe(true);
     expect(secondUpstream.calls).toHaveLength(0);
   });
 

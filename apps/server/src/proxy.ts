@@ -136,6 +136,7 @@ export async function handleChatCompletions(
       return;
     }
     upstreamModel = stripChannelPrefix(body.model, selected.name);
+    upstreamModel = selected.modelMap[upstreamModel] ?? upstreamModel;
     if (!upstreamModel || !selected.models.includes(upstreamModel)) {
       sendOpenAiError(
         reply,
@@ -169,7 +170,7 @@ export async function handleChatCompletions(
     const prefixed = resolveChannelPrefix(body.model, repository.listChannels());
     if (prefixed) {
       channel = prefixed.channel;
-      upstreamModel = prefixed.upstreamModel;
+      upstreamModel = channel.modelMap[prefixed.upstreamModel] ?? prefixed.upstreamModel;
       if (!channel.models.includes(upstreamModel)) {
         sendOpenAiError(
           reply,
@@ -200,11 +201,17 @@ export async function handleChatCompletions(
       }
     } else {
       const configured = repository.listChannelsByModel(body.model);
-      if (configured.length === 0) {
-        sendOpenAiError(reply, 404, `Model "${body.model}" was not found`, 'model_not_found', 'invalid_request_error', 'model');
-        return;
-      }
-      if (configured.length > 1) {
+      const mapped = configured.length === 0
+        ? repository.listChannels().filter((item) => item.enabled && item.models.includes(item.modelMap[body.model] ?? ''))
+        : [];
+      if (configured.length === 0 && mapped.length === 1) {
+        channel = mapped[0]!;
+        upstreamModel = channel.modelMap[body.model]!;
+        if (!channel.enabled) {
+          sendOpenAiError(reply, 503, `Model "${body.model}" has no enabled channel`, 'model_unavailable', 'server_error');
+          return;
+        }
+      } else if (configured.length === 0 && mapped.length > 1) {
         sendOpenAiError(
           reply,
           400,
@@ -214,8 +221,22 @@ export async function handleChatCompletions(
           'model',
         );
         return;
-      }
+      } else if (configured.length === 0) {
+        sendOpenAiError(reply, 404, `Model "${body.model}" was not found`, 'model_not_found', 'invalid_request_error', 'model');
+        return;
+      } else if (configured.length > 1) {
+        sendOpenAiError(
+          reply,
+          400,
+          `Model "${body.model}" is configured on multiple channels; use a channel-specific endpoint`,
+          'model_ambiguous',
+          'invalid_request_error',
+          'model',
+        );
+        return;
+      } else {
       channel = configured[0]!;
+      upstreamModel = channel.modelMap[body.model] ?? body.model;
       if (!channel.enabled) {
         sendOpenAiError(reply, 503, `Model "${body.model}" has no enabled channel`, 'model_unavailable', 'server_error');
         repository.insertLog({
@@ -232,6 +253,7 @@ export async function handleChatCompletions(
           errorSummary: 'no enabled channel',
         });
         return;
+      }
       }
     }
   }
@@ -305,15 +327,26 @@ export async function handleChatCompletions(
             : 'chat/completions';
       let response: Response;
       try {
-        response = await fetchImpl(joinUpstreamUrl(channel.baseUrl, endpoint), {
-          method: 'POST',
-          headers: {
-            ...forwardedClientHeaders(request.headers),
-            ...upstreamHeaders(channel),
-          },
-          body: JSON.stringify(upstreamRequest),
-          signal: abortSignal,
-        });
+        const keys = [channel.apiKey, ...channel.extraApiKeys.filter((key) => key !== channel.apiKey)];
+        let chosen: Response | undefined;
+        for (const apiKey of keys) {
+          for (let attempt = 0; attempt < 2; attempt += 1) {
+            chosen = await fetchImpl(joinUpstreamUrl(channel.baseUrl, endpoint), {
+              method: 'POST',
+              headers: {
+                ...forwardedClientHeaders(request.headers),
+                ...upstreamHeaders({ ...channel, apiKey }),
+              },
+              body: JSON.stringify(upstreamRequest),
+              signal: abortSignal,
+            });
+            if (chosen.status !== 429 || clientDisconnected || attempt === 1) break;
+            await chosen.body?.cancel().catch(() => undefined);
+            await new Promise((resolve) => setTimeout(resolve, 400));
+          }
+          if (!chosen || chosen.status !== 429) break;
+        }
+        response = chosen!;
         clearTimeout(connectTimeout);
       } catch (error) {
         clearTimeout(connectTimeout);
@@ -525,6 +558,7 @@ export async function handleChatCompletions(
             httpStatus: response.status,
             durationMs: Date.now() - startedAt,
             errorSummary: null,
+            ...usageFields((output as { usage?: unknown }).usage),
           });
           return;
         } catch (error) {
@@ -712,6 +746,7 @@ export async function handleChatCompletions(
         httpStatus: response.status,
         durationMs: Date.now() - startedAt,
         errorSummary: null,
+        ...streamResult.usage,
       });
       return;
     }
@@ -725,8 +760,47 @@ export async function handleChatCompletions(
   }
 }
 
+function usageFields(usage: unknown): {
+  promptTokens?: number;
+  completionTokens?: number;
+  totalTokens?: number;
+  cachedTokens?: number;
+} {
+  if (typeof usage !== 'object' || usage === null) return {};
+  const record = usage as Record<string, unknown>;
+  const num = (value: unknown) => (typeof value === 'number' && Number.isFinite(value) && value >= 0 ? Math.floor(value) : undefined);
+  const promptTokens = num(record.prompt_tokens);
+  const completionTokens = num(record.completion_tokens);
+  const totalTokens = num(record.total_tokens);
+  const details = record.prompt_tokens_details;
+  const cachedTokens = typeof details === 'object' && details !== null
+    ? num((details as { cached_tokens?: unknown }).cached_tokens)
+    : undefined;
+  return {
+    ...(promptTokens === undefined ? {} : { promptTokens }),
+    ...(completionTokens === undefined ? {} : { completionTokens }),
+    ...(totalTokens === undefined ? {} : { totalTokens }),
+    ...(cachedTokens === undefined ? {} : { cachedTokens }),
+  };
+}
+
+function scanSseUsage(text: string, store: { fields?: ReturnType<typeof usageFields> }): void {
+  for (const line of text.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith('data:')) continue;
+    const payload = trimmed.slice(5).trim();
+    if (payload === '' || payload === '[DONE]') continue;
+    try {
+      const fields = usageFields((JSON.parse(payload) as { usage?: unknown }).usage);
+      if (Object.keys(fields).length > 0) store.fields = fields;
+    } catch {
+      /* 非 JSON 帧忽略 */
+    }
+  }
+}
+
 type StreamResult =
-  | { kind: 'ok' }
+  | { kind: 'ok'; usage?: ReturnType<typeof usageFields> }
   | { kind: 'failed'; reason: string }
   | { kind: 'stream_error'; reason: string }
   | { kind: 'client_aborted' };
@@ -758,6 +832,7 @@ async function consumeStream(options: ConsumeStreamOptions): Promise<StreamResul
         : createOpenAiStreamTransformer(options.exposedModel);
 
   let wroteAnything = false;
+  const usageStore: { fields?: ReturnType<typeof usageFields> } = {};
   let timeout: NodeJS.Timeout | null = null;
   let activeTimeoutReason: 'connect' | 'idle' = 'connect';
 
@@ -813,15 +888,19 @@ async function consumeStream(options: ConsumeStreamOptions): Promise<StreamResul
         if (!wroteAnything) return { kind: 'failed', reason: safeErrorMessage(error) };
         throw error;
       }
+      scanSseUsage(output, usageStore);
       write(output);
       armTimer(wroteAnything ? 'idle' : 'connect');
     }
     const tail = transformer.push(decoder.decode());
+    scanSseUsage(tail, usageStore);
     write(tail);
-    write(transformer.flush());
+    const flushed = transformer.flush();
+    scanSseUsage(flushed, usageStore);
+    write(flushed);
     if (!wroteAnything) return { kind: 'failed', reason: 'upstream stream ended without data' };
     if (!options.reply.raw.writableEnded) options.reply.raw.end();
-    return { kind: 'ok' };
+    return { kind: 'ok', ...(usageStore.fields ? { usage: usageStore.fields } : {}) };
   } finally {
     clearTimer();
     reader.releaseLock();

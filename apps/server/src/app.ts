@@ -11,6 +11,7 @@ import type { RelayModule } from './relay.js';
 import { bearerToken, tokensEqual } from './auth.js';
 import { Repository } from './db.js';
 import { sendOpenAiError } from './errors.js';
+import { anthropicMessagesToChat } from './messages-inbound.js';
 import { handleChatCompletions } from './proxy.js';
 import { registerAdminRoutes } from './admin-routes.js';
 import { listPublicModels } from './model-list.js';
@@ -134,7 +135,7 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     } satisfies ModelList;
   });
 
-  app.post('/v1/chat/completions', async (request, reply) => {
+  async function dispatchChat(request: { body?: unknown; method?: string; url?: string; headers: import('fastify').FastifyRequest['headers'] }, reply: import('fastify').FastifyReply): Promise<void> {
     // 订阅中转优先：模型名带它的六个前缀之一时整单交给 relay，不再进 AiHub 的
     // 渠道路由。前缀是 relay 的命名空间（AiHub 的渠道模型名不带斜杠），
     // 正常情况下不会撞车；真撞了也以 relay 为准，行为才可预测。
@@ -156,10 +157,33 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
       }
       return;
     }
-    await handleChatCompletions(request, reply, {
+    await handleChatCompletions(request as import('fastify').FastifyRequest, reply, {
       repository: options.repository,
       ...(options.fetchImpl ? { fetchImpl: options.fetchImpl } : {}),
     });
+  }
+
+  app.post('/v1/chat/completions', async (request, reply) => {
+    await dispatchChat(request, reply);
+  });
+
+  app.post('/v1/messages', async (request, reply) => {
+    let chatBody: Record<string, unknown>;
+    try {
+      chatBody = anthropicMessagesToChat(request.body);
+    } catch (error) {
+      sendOpenAiError(
+        reply,
+        400,
+        error instanceof Error ? error.message : 'invalid messages request',
+        'invalid_request_error',
+        'invalid_request_error',
+        'messages',
+      );
+      return;
+    }
+    request.body = chatBody;
+    await dispatchChat(request, reply);
   });
 
   app.post('/v1/channels/:channelId/chat/completions', async (request, reply) => {

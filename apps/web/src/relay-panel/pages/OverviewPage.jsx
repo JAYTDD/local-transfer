@@ -49,6 +49,23 @@ export default function OverviewPage({ health, navigate }) {
         </div>
       </section>
 
+      {health && health.providers.some((item) => {
+        const state = regionState(item);
+        return state.cls === 'err' || state.cls === 'warn';
+      }) && (
+        <section className="section">
+          {health.providers.flatMap((item) => {
+            const state = regionState(item);
+            if (state.cls !== 'err' && state.cls !== 'warn') return [];
+            return [(
+              <p key={item.prefix} className="small" style={{ margin: '4px 0' }}>
+                {item.label ?? item.prefix}：{state.title}
+              </p>
+            )];
+          })}
+        </section>
+      )}
+
       {!health && <div className="section"><div className="skeleton" style={{ height: 120 }} /></div>}
 
       {health && (

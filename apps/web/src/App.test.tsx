@@ -29,7 +29,9 @@ describe('admin shell', () => {
     );
     render(<App />);
     expect(await screen.findByRole('heading', { name: '渠道' })).toBeInTheDocument();
-    expect(screen.queryByText('模型')).not.toBeInTheDocument();
+    expect(screen.getByRole('menuitem', { name: '模型' })).toBeInTheDocument();
+    expect(screen.getByRole('menuitem', { name: '用量' })).toBeInTheDocument();
+    expect(screen.getByRole('menuitem', { name: '用量' })).toBeInTheDocument();
     expect(screen.getByText('日志')).toBeInTheDocument();
     expect(screen.getByText('设置')).toBeInTheDocument();
   });

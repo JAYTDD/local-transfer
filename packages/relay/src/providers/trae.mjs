@@ -23,6 +23,31 @@ const logger = {
 
 export const TRAE_REGIONS = ['cn', 'ai'];
 
+function displayKey(value) {
+  return String(value ?? '').trim().toLowerCase();
+}
+
+/**
+ * 把 SOLO 线目录里的 `max_tokens` 补回合并结果。
+ *
+ * 官方 `mergeTraeModelSources` 只留 Remote 的上下文和推理，线目录上的输出上限被丢掉。
+ * 对齐方式和合并相同：先按 id，再按显示名。合并结果里已经有正数上限时不覆盖。
+ */
+export function attachWireMaxTokens(merged, wire) {
+  const byId = new Map();
+  const byName = new Map();
+  for (const model of wire ?? []) {
+    if (typeof model?.maxTokens !== 'number' || !(model.maxTokens > 0)) continue;
+    byId.set(displayKey(model.id), model.maxTokens);
+    if (typeof model.name === 'string' && model.name !== '') byName.set(displayKey(model.name), model.maxTokens);
+  }
+  return (merged ?? []).map((model) => {
+    if (typeof model.maxTokens === 'number' && model.maxTokens > 0) return model;
+    const maxTokens = byId.get(displayKey(model.id)) ?? byName.get(displayKey(model.name));
+    return maxTokens === undefined ? model : { ...model, maxTokens };
+  });
+}
+
 /** 丢弃"Remote 广告了、但 get_detail_param 没有匹配项"的死 config_name（源 dropDeadModels）。 */
 export function dropDeadModels(rows, wire) {
   if (!wire.resolved) return rows;
@@ -211,7 +236,7 @@ export function createTraeProvider(region) {
       } catch (e) {
         lastErr.push(`wire: ${e.message}`);
       }
-      const merged = trae.mergeTraeModelSources(remote, local);
+      const merged = attachWireMaxTokens(trae.mergeTraeModelSources(remote, local), local);
 
       // 记录本区域确认可调用的显示键（源 discoverModels）
       wire.callableKeys.clear();

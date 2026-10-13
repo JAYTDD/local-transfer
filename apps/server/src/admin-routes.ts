@@ -1,11 +1,12 @@
 import type { FastifyInstance } from 'fastify';
 
-import type { RelayChannelToggle, RelayStatusDto, SettingsDto } from '@aihub/shared';
+import type { ModelCapabilitiesDto, RelayChannelToggle, RelayStatusDto, SettingsDto, UsageReportDto } from '@aihub/shared';
 
-import { Repository } from './db.js';
+import { isLaunchAtLogin, setLaunchAtLogin, autostartSupported } from './autostart.js';
+import { maskSecret, Repository } from './db.js';
 import { channelToDto, logsToDto } from './dto.js';
 import { AdminRequestError, sendAdminError } from './errors.js';
-import type { RelayModule } from './relay.js';
+import { applyUsageCatalog, creditCost, type RelayModule } from './relay.js';
 import { pullUpstreamModels, testUpstreamChannel } from './upstream.js';
 import {
   channelInputSchema,
@@ -14,6 +15,7 @@ import {
   channelTestSchema,
   formatZodError,
   logQuerySchema,
+  usageQuerySchema,
   pullModelsSchema,
   relaySettingsInputSchema,
   settingsInputSchema,
@@ -60,6 +62,8 @@ export async function registerAdminRoutes(
         defaultMaxTokens: input.defaultMaxTokens,
         enabled: input.enabled,
         models: input.models,
+        modelMap: input.modelMap ?? {},
+        extraApiKeys: input.extraApiKeys ?? [],
       });
       reply.code(201);
       return { data: channelToDto(channel) };
@@ -94,6 +98,8 @@ export async function registerAdminRoutes(
         defaultMaxTokens: input.defaultMaxTokens,
         enabled: input.enabled,
         models: input.models,
+        modelMap: input.modelMap ?? existing.modelMap,
+        extraApiKeys: input.extraApiKeys ?? existing.extraApiKeys,
       });
       return { data: channelToDto(channel!) };
     } catch (error) {
@@ -173,6 +179,33 @@ export async function registerAdminRoutes(
     }
   });
 
+  app.get('/api/admin/usage', async (request, reply) => {
+    try {
+      const query = parseOrThrow(usageQuerySchema, request.query);
+      const catalog = relay?.gateway()?.usageCatalog() ?? {};
+      const entries = applyUsageCatalog(
+        repository.listLogs({ ...query, protocol: 'relay' }) as UsageReportDto['entries'],
+        catalog,
+      ).map((entry) => ({ ...entry, credits: creditCost(entry) }));
+      const summary = applyUsageCatalog(
+        repository.summarizeRelayUsage(query) as UsageReportDto['summary'],
+        catalog,
+      ).map((row) => ({
+        ...row,
+        creditRate: row.creditRate ?? null,
+        credits: creditCost({
+          promptTokens: row.promptTokens,
+          completionTokens: row.completionTokens,
+          creditRate: row.creditRate ?? null,
+        }),
+      }));
+      const report: UsageReportDto = { summary, entries };
+      return { data: report };
+    } catch (error) {
+      sendAdminError(reply, error);
+    }
+  });
+
   app.get('/api/admin/logs', async (request, reply) => {
     try {
       const query = parseOrThrow(logQuerySchema, request.query);
@@ -182,31 +215,67 @@ export async function registerAdminRoutes(
     }
   });
 
-  app.get('/api/admin/settings', async () => {
+  app.get('/api/admin/backup', async (request) => {
+    const secrets = (request.query as { secrets?: string }).secrets === '1';
     const settings = repository.getSettings();
-    const dto: SettingsDto = {
+    return {
+      data: {
+        settings: {
+          connectTimeoutMs: settings.connectTimeoutMs,
+          streamIdleTimeoutMs: settings.streamIdleTimeoutMs,
+          logRetentionDays: settings.logRetentionDays,
+          relayEnabled: settings.relayEnabled,
+          relayChannels: settings.relayChannels,
+          ...(secrets ? { gatewayToken: settings.gatewayToken } : {}),
+        },
+        channels: repository.listChannels().map((channel) => ({
+          name: channel.name,
+          protocol: channel.protocol,
+          baseUrl: channel.baseUrl,
+          defaultMaxTokens: channel.defaultMaxTokens,
+          enabled: channel.enabled,
+          models: channel.models,
+          modelMap: channel.modelMap,
+          ...(secrets ? { apiKey: channel.apiKey, extraApiKeys: channel.extraApiKeys } : { apiKeyMasked: maskSecret(channel.apiKey), extraKeyCount: channel.extraApiKeys.length }),
+        })),
+      },
+    };
+  });
+
+  async function settingsDto(): Promise<SettingsDto> {
+    const settings = repository.getSettings();
+    return {
       gatewayToken: settings.gatewayToken,
       connectTimeoutMs: settings.connectTimeoutMs,
       streamIdleTimeoutMs: settings.streamIdleTimeoutMs,
+      logRetentionDays: settings.logRetentionDays,
+      launchAtLogin: await isLaunchAtLogin(),
+      launchAtLoginSupported: autostartSupported(),
     };
-    return { data: dto };
-  });
+  }
+
+  app.get('/api/admin/settings', async () => ({ data: await settingsDto() }));
 
   app.put('/api/admin/settings', async (request, reply) => {
     try {
       const input = parseOrThrow(settingsInputSchema, request.body);
-      repository.updateSettings(input);
-      const settings = repository.getSettings();
-      return {
-        data: {
-          gatewayToken: settings.gatewayToken,
-          connectTimeoutMs: settings.connectTimeoutMs,
-          streamIdleTimeoutMs: settings.streamIdleTimeoutMs,
-        },
-      };
+      const { launchAtLogin, ...stored } = input;
+      if (Object.keys(stored).length > 0) repository.updateSettings(stored);
+      if (launchAtLogin !== undefined) await setLaunchAtLogin(launchAtLogin);
+      return { data: await settingsDto() };
     } catch (error) {
       sendAdminError(reply, error);
     }
+  });
+
+  app.get('/api/admin/model-capabilities', async (request) => {
+    const gateway = relay?.gateway() ?? null;
+    if (!gateway) {
+      return { data: { models: [], fetchedAt: null, errors: [] } satisfies ModelCapabilitiesDto };
+    }
+    const refresh = (request.query as { refresh?: string }).refresh;
+    const force = refresh === '1' || refresh === 'true';
+    return { data: await gateway.modelCapabilities({ force }) };
   });
 
   app.get('/api/admin/relay', async () => ({ data: relayStatus(repository, relay) }));

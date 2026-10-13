@@ -9,6 +9,10 @@ export interface ChannelRecord {
   defaultMaxTokens: number;
   enabled: boolean;
   models: string[];
+  /** 对外名 → 上游模型名 */
+  modelMap: Record<string, string>;
+  /** 同一 baseUrl 下，主密钥 429 之后再试的密钥 */
+  extraApiKeys: string[];
   position: number;
   createdAt: number;
   updatedAt: number;
@@ -26,6 +30,12 @@ export interface LogRecordInput {
   httpStatus: number | null;
   durationMs: number;
   errorSummary: string | null;
+  modelName?: string | null;
+  promptTokens?: number | null;
+  completionTokens?: number | null;
+  totalTokens?: number | null;
+  cachedTokens?: number | null;
+  creditRate?: string | null;
 }
 
 export interface LogFilters {
@@ -37,4 +47,5 @@ export interface LogFilters {
   stream?: boolean;
   from?: number;
   to?: number;
+  protocol?: string;
 }

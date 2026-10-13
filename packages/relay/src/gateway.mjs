@@ -11,20 +11,26 @@
  *   - channels()                本次实际装配的通道前缀（供宿主做健康度展示）
  *   - hasPrefix(model)          模型名是不是本模块的（六个前缀之一）
  *   - listModels()              六个通道的模型清单（宿主并入自己的 /v1/models）
+ *   - modelCapabilities()       已启用模型的上下文 / 思考等级 / 输出上限（5 分钟缓存）
  *   - handleChat(body, res)     处理一次 chat 请求；body 由宿主解析后传入
  *   - panelApi                  控制面板的数据 API（由 AiHub 管理端调用）
  *
  * 与独立版本的差异只有进程入口那一层：请求体解析交给宿主（Fastify 已经
  * 消费了流），路由分发改由宿主完成，其余逻辑（模型路由、出站兼容、
- * SSE 规范化、非流式聚合、请求日志）与原实现逐字一致。
+ * SSE 规范化、非流式聚合、请求日志）与原实现一致；WorkBuddy 的 SSE 已符合
+ * OpenAI 格式，因此在宿主转发时直接透传字节流。
  */
 import { createTraeProvider } from './providers/trae.mjs';
 import { createWorkBuddyProvider } from './providers/workbuddy.mjs';
 import { createQoderProvider } from './providers/qoder.mjs';
 import { createPanelApi } from './panel/api.mjs';
-import { resolveModel } from './model-routing.mjs';
+import { pipeline } from 'node:stream/promises';
+import { fitReasoningEffort, requestHasImage, resolveModel } from './model-routing.mjs';
+import { collectRows, createCapabilityCache, toPublicModelExtras } from './model-capabilities.mjs';
+import { fetchWithRetry } from './retry.mjs';
 import { rewriteClaudeCodeSignature, stripBillingHeader } from './workbuddy-compat.mjs';
 import { logRequest, setLogSink } from './request-log.mjs';
+import { createUsageTap, readUsage, snapshotModel } from './usage.mjs';
 
 /** 六个通道前缀。宿主要求模型名带这些前缀时才交给本模块。 */
 export const CHANNEL_PREFIXES = ['trae', 'traeg', 'wb', 'wbai', 'qoder', 'qoderg'];
@@ -97,6 +103,7 @@ function json(res, status, body) {
  */
 export function createRelayGateway({ channels = {}, endpoint, onLog } = {}) {
   const state = { providers: [], ready: false };
+  const capabilityCache = createCapabilityCache();
 
   const panelApi = createPanelApi({ providers: () => state.providers, endpoint });
 
@@ -130,13 +137,50 @@ export function createRelayGateway({ channels = {}, endpoint, onLog } = {}) {
           // 上游的 id 往往是内部代号（Qoder 的 qmodel_latest、WorkBuddy 的 hy3），
           // 没有这个字段就只能对着代号猜。缺 name 时回落到 id，并统一带上通道前缀。
           name: `${p.def.prefix}/${displayName}`,
-          ...(m.contextWindow === undefined ? {} : { context_window: m.contextWindow }),
-          ...(m.maxTokens === undefined ? {} : { max_tokens: m.maxTokens }),
-          ...(m.reasoningSupported === undefined ? {} : { reasoning: m.reasoningSupported }),
+          ...toPublicModelExtras(m),
         });
       }
     }
     return data;
+  }
+
+  /**
+   * 已启用模型的能力快照。
+   *
+   * force 或距上次拉取已满 5 分钟时，对正在服务的通道并行 refreshModels。
+   * 列表始终再读一次 models()，所以启用开关的变化不必等缓存过期。
+   */
+  function modelCapabilities({ force = false } = {}) {
+    return capabilityCache.load({
+      force,
+      async refresh() {
+        const targets = state.providers.filter(
+          (entry) => serving(entry) && typeof entry.provider?.refreshModels === 'function',
+        );
+        const settled = await Promise.all(targets.map(async (entry) => {
+          try {
+            await entry.provider.refreshModels();
+            return null;
+          } catch (error) {
+            return {
+              prefix: entry.def.prefix,
+              label: entry.def.label,
+              message: String(error?.message ?? error),
+            };
+          }
+        }));
+        return settled.filter(Boolean);
+      },
+      read() {
+        return collectRows(
+          state.providers.filter(serving).map((entry) => ({
+            prefix: entry.def.prefix,
+            label: entry.def.label,
+            provider: entry.provider,
+          })),
+        );
+      },
+    });
   }
 
   /**
@@ -200,22 +244,30 @@ export function createRelayGateway({ channels = {}, endpoint, onLog } = {}) {
     }
     const finalFinish = toolCalls.size > 0 ? 'tool_calls' : (finish || 'stop');
     return {
-      id,
-      object: 'chat.completion',
-      created,
-      model,
-      choices: [{ index: 0, message, finish_reason: finalFinish }],
-      usage: usage ?? { prompt_tokens: 0, completion_tokens: Math.ceil((content.length + reasoning.length) / 4), total_tokens: 0 },
+      completion: {
+        id,
+        object: 'chat.completion',
+        created,
+        model,
+        choices: [{ index: 0, message, finish_reason: finalFinish }],
+        usage: usage ?? { prompt_tokens: 0, completion_tokens: Math.ceil((content.length + reasoning.length) / 4), total_tokens: 0 },
+      },
+      usage: readUsage(usage),
     };
   }
 
-  /** 逐行解析上游 SSE，规范化后转发。 */
+  /** 逐行解析上游 SSE，规范化后转发。返回上游 usage（没有则为 undefined）。 */
   async function relayStream(body, res) {
     const decoder = new TextDecoder();
     const encoder = new TextEncoder();
     let buffer = '';
+    let captured;
     const seen = { role: false };
     const write = (obj) => res.write(encoder.encode(`data: ${JSON.stringify(obj)}\n\n`));
+    const take = (obj) => {
+      const next = readUsage(obj?.usage);
+      if (next) captured = next;
+    };
 
     for await (const chunk of body) {
       buffer += decoder.decode(chunk, { stream: true });
@@ -228,6 +280,7 @@ export function createRelayGateway({ channels = {}, endpoint, onLog } = {}) {
         if (payload === '[DONE]') { res.write(encoder.encode('data: [DONE]\n\n')); continue; }
         let obj;
         try { obj = JSON.parse(payload); } catch { continue; }
+        take(obj);
         if (obj.error) { write({ error: obj.error }); continue; }
         const norm = normalizeChunk(obj, seen);
         if (norm) write(norm);
@@ -237,11 +290,14 @@ export function createRelayGateway({ channels = {}, endpoint, onLog } = {}) {
       const payload = buffer.trim().slice(5).trim();
       if (payload && payload !== '[DONE]') {
         try {
-          const norm = normalizeChunk(JSON.parse(payload), seen);
+          const obj = JSON.parse(payload);
+          take(obj);
+          const norm = normalizeChunk(obj, seen);
           if (norm) write(norm);
         } catch { /* 忽略尾部残片 */ }
       }
     }
+    return captured;
   }
 
   /**
@@ -257,7 +313,17 @@ export function createRelayGateway({ channels = {}, endpoint, onLog } = {}) {
     const modelId = body?.model;
     for (const p of state.providers) currentModels(p);
     const startedAt = Date.now();
-    const hit = resolveModel(state.providers.filter(serving), modelId);
+    let hit = resolveModel(state.providers.filter(serving), modelId);
+    if (!hit && typeof modelId === 'string') {
+      const entry = state.providers.find((item) => serving(item) && modelId.startsWith(`${item.def.prefix}/`));
+      if (entry?.provider?.refreshModels) {
+        try {
+          await entry.provider.refreshModels();
+          currentModels(entry);
+          hit = resolveModel(state.providers.filter(serving), modelId);
+        } catch { /* 刷新失败仍按未知模型返回 */ }
+      }
+    }
     if (!hit) {
       // 解析失败是最高频的用户错误（显示名当 ID、大小写错、目录未刷新），必须留痕
       logRequest({
@@ -272,6 +338,15 @@ export function createRelayGateway({ channels = {}, endpoint, onLog } = {}) {
     }
     const { provider, upstreamModel } = hit;
     const wantStream = body.stream === true;
+    const logHit = (fields) => logRequest({
+      channel: provider.def.prefix,
+      model: modelId,
+      upstreamModel,
+      stream: wantStream,
+      channelLabel: provider.def.label,
+      ...snapshotModel(currentModels(provider), upstreamModel),
+      ...fields,
+    });
     // 客户端断开（取消生成/关页面）就中止上游，别让订阅额度白烧。
     // res 'close' 在正常完成后也会触发，那时 abort 是无害的 no-op。
     const abort = new AbortController();
@@ -284,24 +359,36 @@ export function createRelayGateway({ channels = {}, endpoint, onLog } = {}) {
       outbound = stripBillingHeader(outbound);
       if (hit.provider.def.prefix === 'wbai') outbound = rewriteClaudeCodeSignature(outbound);
     }
-    const upstreamBody = { ...outbound, model: upstreamModel, stream: true };
+    const catalogModel = (provider.models ?? []).find((model) => model.id === upstreamModel);
+    if (requestHasImage(outbound) && catalogModel?.supportsImages !== true && !catalogModel?.input?.includes('image') && catalogModel?.multimodal !== true) {
+      logHit({
+        status: 'error', httpStatus: 400, durationMs: Date.now() - startedAt,
+        error: 'model does not accept images',
+      });
+      return json(res, 400, { error: { message: `Model "${modelId}" does not accept image input` } });
+    }
+    const upstreamBody = { ...fitReasoningEffort(outbound, catalogModel), model: upstreamModel, stream: true };
 
     let r;
     try {
-      r = await fetch(`${provider.shim.baseUrl()}/v1/chat/completions`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${provider.shim.token()}`,
-          Accept: 'text/event-stream',
+      // 三个订阅通道的 429 按 DSH 的 llm-retry 语义退避重试；
+      // 非 429 状态原样返回。
+      r = await fetchWithRetry(
+        `${provider.shim.baseUrl()}/v1/chat/completions`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${provider.shim.token()}`,
+            Accept: 'text/event-stream',
+          },
+          body: JSON.stringify(upstreamBody),
+          signal: abort.signal,
         },
-        body: JSON.stringify(upstreamBody),
-        signal: abort.signal,
-      });
+        { kind: hit.provider.def.kind, signal: abort.signal },
+      );
     } catch (e) {
-      logRequest({
-        channel: provider.def.prefix, model: modelId, upstreamModel, stream: wantStream,
-        channelLabel: provider.def.label,
+      logHit({
         status: abort.signal.aborted ? 'aborted' : 'error',
         durationMs: Date.now() - startedAt,
         ...(abort.signal.aborted ? {} : { error: String(e.message ?? e).slice(0, 200) }),
@@ -312,9 +399,7 @@ export function createRelayGateway({ channels = {}, endpoint, onLog } = {}) {
 
     if (!r.ok) {
       const text = await r.text().catch(() => '');
-      logRequest({
-        channel: provider.def.prefix, model: modelId, upstreamModel, stream: wantStream,
-        channelLabel: provider.def.label,
+      logHit({
         status: 'error', httpStatus: r.status, durationMs: Date.now() - startedAt,
         error: text.slice(0, 200),
       });
@@ -328,27 +413,34 @@ export function createRelayGateway({ channels = {}, endpoint, onLog } = {}) {
         Connection: 'keep-alive',
       });
       if (!r.body) return res.end();
-      await relayStream(r.body, res);
-      logRequest({
-        channel: provider.def.prefix, model: modelId, upstreamModel, stream: true,
-        channelLabel: provider.def.label,
-        status: abort.signal.aborted ? 'aborted' : 'ok', durationMs: Date.now() - startedAt,
+      let usage;
+      if (provider.def.kind === 'workbuddy') {
+        // WorkBuddy shim already emits OpenAI-compatible SSE. The tap only
+        // reads usage; every byte still reaches the client unchanged.
+        const tap = createUsageTap();
+        await pipeline(r.body, tap.stream, res);
+        usage = tap.usage();
+      } else {
+        usage = await relayStream(r.body, res);
+      }
+      logHit({
+        status: abort.signal.aborted ? 'aborted' : 'ok',
+        durationMs: Date.now() - startedAt,
+        ...usage,
       });
-      return res.end();
+      if (!res.writableEnded) res.end();
+      return;
     }
 
     try {
-      const result = await collectStream(r, upstreamModel);
-      logRequest({
-        channel: provider.def.prefix, model: modelId, upstreamModel, stream: false,
-        channelLabel: provider.def.label,
+      const { completion, usage } = await collectStream(r, upstreamModel);
+      logHit({
         status: 'ok', durationMs: Date.now() - startedAt,
+        ...usage,
       });
-      return json(res, 200, result);
+      return json(res, 200, completion);
     } catch (e) {
-      logRequest({
-        channel: provider.def.prefix, model: modelId, upstreamModel, stream: false,
-        channelLabel: provider.def.label,
+      logHit({
         status: abort.signal.aborted ? 'aborted' : 'error', durationMs: Date.now() - startedAt,
         ...(abort.signal.aborted ? {} : { error: String(e.message ?? e).slice(0, 200) }),
       });
@@ -396,6 +488,17 @@ export function createRelayGateway({ channels = {}, endpoint, onLog } = {}) {
     start,
     stop,
     listModels,
+    modelCapabilities,
+    usageCatalog() {
+      const labels = {};
+      for (const entry of state.providers) {
+        if (!serving(entry)) continue;
+        for (const model of currentModels(entry)) {
+          labels[`${entry.def.prefix}/${model.id}`] = snapshotModel([model], model.id);
+        }
+      }
+      return labels;
+    },
     handleChat,
     panelApi,
     /** 六个前缀（宿主用于路由分流与展示） */

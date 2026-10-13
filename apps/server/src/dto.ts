@@ -13,6 +13,8 @@ export function channelToDto(channel: ChannelRecord): ChannelDto {
     defaultMaxTokens: channel.defaultMaxTokens,
     enabled: channel.enabled,
     models: channel.models,
+    modelMap: channel.modelMap,
+    extraKeyCount: channel.extraApiKeys.length,
     position: channel.position,
     createdAt: channel.createdAt,
     updatedAt: channel.updatedAt,

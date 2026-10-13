@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { sanitizeCatalog, deriveCatalog } from 'dsh-connect-trae';
-import { dropDeadModels } from '../src/providers/trae.mjs';
+import { attachWireMaxTokens, dropDeadModels } from '../src/providers/trae.mjs';
 
 const wire = (resolved, keys) => ({ resolved, callableKeys: new Set(keys) });
 
@@ -25,6 +25,31 @@ test('deriveCatalog 有选集时按选集过滤', () => {
 test('deriveCatalog 预算等于 maxContextWindow 时提升 contextWindow', () => {
   const out = deriveCatalog([{ id: 'a', maxContextWindow: 200000 }], new Set(), { a: 200000 });
   assert.equal(out[0].contextWindow, 200000);
+});
+
+test('attachWireMaxTokens 按 id 把线目录的输出上限补回合并行', () => {
+  const merged = [{ id: 'DeepSeek-V4-Flash', name: 'DeepSeek V4 Flash', contextWindow: 128000 }];
+  const wire = [{ id: 'DeepSeek-V4-Flash', name: '别名', maxTokens: 8192 }];
+  assert.equal(attachWireMaxTokens(merged, wire)[0].maxTokens, 8192);
+});
+
+test('attachWireMaxTokens 在 id 对不上时按显示名匹配，已有上限不覆盖', () => {
+  const merged = [
+    { id: 'remote-id', name: 'Pretty Name', contextWindow: 1000 },
+    { id: 'kept', name: 'Kept', maxTokens: 100 },
+  ];
+  const wire = [
+    { id: 'wire-id', name: 'Pretty Name', maxTokens: 4096 },
+    { id: 'kept', name: 'Kept', maxTokens: 9999 },
+  ];
+  const out = attachWireMaxTokens(merged, wire);
+  assert.equal(out[0].maxTokens, 4096);
+  assert.equal(out[1].maxTokens, 100);
+});
+
+test('attachWireMaxTokens 线目录没有上限时保持原样', () => {
+  const merged = [{ id: 'a', name: 'A' }];
+  assert.equal(attachWireMaxTokens(merged, [{ id: 'a', name: 'A' }])[0].maxTokens, undefined);
 });
 
 test('dropDeadModels 未 resolve 时不过滤（首次 discovery 前没有证据）', () => {

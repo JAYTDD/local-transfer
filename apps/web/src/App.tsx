@@ -1,6 +1,8 @@
 import {
+  BarChart3,
   Boxes,
   Cable,
+  Cpu,
   ScrollText,
   Settings,
 } from 'lucide-react';
@@ -10,8 +12,10 @@ import { BrowserRouter } from 'react-router-dom';
 
 import { ChannelsPage } from './pages/ChannelsPage.js';
 import { LogsPage } from './pages/LogsPage.js';
+import { ModelsPage } from './pages/ModelsPage.js';
 import { RelayPage } from './pages/RelayPage.js';
 import { SettingsPage } from './pages/SettingsPage.js';
+import { UsagePage } from './pages/UsagePage.js';
 
 const { Content } = Layout;
 
@@ -54,6 +58,8 @@ function AdminShell() {
             items={[
               { key: 'channels', icon: <Cable size={15} />, label: '渠道' },
               { key: 'relay', icon: <Boxes size={15} />, label: '订阅中转' },
+              { key: 'models', icon: <Cpu size={15} />, label: '模型' },
+              { key: 'usage', icon: <BarChart3 size={15} />, label: '用量' },
               { key: 'logs', icon: <ScrollText size={15} />, label: '日志' },
               { key: 'settings', icon: <Settings size={15} />, label: '设置' },
             ]}
@@ -65,6 +71,8 @@ function AdminShell() {
           <Route path="/" element={<Navigate to="/channels" replace />} />
           <Route path="/channels" element={<ChannelsPage token={token} />} />
           <Route path="/relay" element={<RelayPage token={token} />} />
+          <Route path="/models" element={<ModelsPage token={token} />} />
+          <Route path="/usage" element={<UsagePage token={token} />} />
           <Route path="/logs" element={<LogsPage token={token} />} />
           <Route path="/settings" element={<SettingsPage token={token} />} />
           <Route path="*" element={<Navigate to="/channels" replace />} />
